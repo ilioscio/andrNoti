@@ -1,0 +1,6 @@
+# Nix build outputs
+result
+result-*
+
+# Flutter-generated project metadata
+app/.metadata
