@@ -182,7 +182,7 @@ class NotificationTaskHandler extends TaskHandler {
         ),
       ),
       payload: n.id.toString(),
-    );
+    ).catchError((e) => _dbg('_showAlert error: $e'));
   }
 }
 

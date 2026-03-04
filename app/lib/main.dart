@@ -32,6 +32,12 @@ Future<void> main() async {
   initForegroundTask();
   await initLocalNotifications(onNotificationResponse: onNotificationResponse);
 
+  // Ask Android to exempt us from Doze/battery optimisation.
+  // Shows a system dialog once; no-ops if already granted.
+  if (!await FlutterForegroundTask.isIgnoringBatteryOptimizations) {
+    await FlutterForegroundTask.requestIgnoreBatteryOptimization();
+  }
+
   final config = await AppConfig.load();
   if (config.isConfigured) {
     await startForegroundService();
