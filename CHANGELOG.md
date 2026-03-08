@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.4.1] — 2026-03-07
+
+### Android App
+- **Notification dedup**: `_onTaskData` now checks existing IDs before inserting
+  a live notification into `_newNotifications`. Multiple simultaneous WebSocket
+  connections (e.g. stale sessions from `flutter run` installs over an existing
+  APK) previously caused the same notification to be inserted multiple times,
+  producing duplicate list items.
+- **Dismissible crash fix**: `_markOneSeen` now uses `removeWhere((x) => x.id ==
+  n.id)` instead of `.remove(n)`. The old reference-equality remove failed when
+  the list was rebuilt (by HTTP history or duplicate WS messages) between widget
+  creation and swipe, leaving the dismissed `Dismissible` in the tree and
+  throwing a Flutter widget-library assertion error.
+
+### Notes
+- The root cause of duplicate connections (`sent_to > 1` from one device) is
+  stale WS connections from prior service instances surviving the server's 70s
+  ping deadline. Happens reliably with `flutter run` installs; rare with the
+  release APK. The dedup is a correct safety net regardless.
+
 ## [0.4.0] — 2026-03-07
 
 ### Server

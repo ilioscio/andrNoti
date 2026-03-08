@@ -93,6 +93,11 @@ class _HomeScreenState extends State<HomeScreen>
       switch (msg['type']) {
         case 'notification':
           final n = AppNotification.fromJson(msg);
+          // Dedup: multiple WS connections (e.g. during flutter run / stale sessions)
+          // can deliver the same notification ID more than once. Duplicate Dismissible
+          // keys cause a widget-tree assertion error on swipe.
+          if (_newNotifications.any((x) => x.id == n.id) ||
+              _oldNotifications.any((x) => x.id == n.id)) break;
           notificationStore[n.id] = n;
           setState(() => _newNotifications.insert(0, n));
           _heartbeatKey.currentState?.addBeat(true);
@@ -200,14 +205,16 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   Future<void> _markOneSeen(AppNotification n) async {
-    // Update local state immediately — Dismissible has already removed it visually.
+    // Remove by ID (not reference) so this works even if the list was rebuilt
+    // from HTTP between when the Dismissible was created and when onDismissed fires.
     setState(() {
-      _newNotifications.remove(n);
+      _newNotifications.removeWhere((x) => x.id == n.id);
       _oldNotifications = [
         AppNotification(
           id: n.id,
           title: n.title,
           text: n.text,
+          source: n.source,
           createdAt: n.createdAt,
           seenAt: DateTime.now(),
         ),
