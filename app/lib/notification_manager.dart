@@ -58,8 +58,9 @@ class NotificationTaskHandler extends TaskHandler {
 
   // Relay-down tracking
   DateTime? _disconnectedSince;
+  DateTime? _relayDownSince; // set when we actually fire the local notification
   bool _relayDownNotified = false;
-  int _graceSeconds = 120;
+  int _graceSeconds = 60;
 
   late AppConfig _config;
 
@@ -87,8 +88,14 @@ class NotificationTaskHandler extends TaskHandler {
       final elapsed = DateTime.now().difference(_disconnectedSince!).inSeconds;
       if (elapsed >= _graceSeconds) {
         _dbg('relay down for ${elapsed}s — firing local notification');
+        _relayDownSince = _disconnectedSince;
         _fireRelayDownAlert();
         _relayDownNotified = true;
+        // Tell main isolate to show an optimistic entry in the New tab immediately.
+        FlutterForegroundTask.sendDataToMain({
+          'type': 'relayDown',
+          'downSince': _disconnectedSince!.millisecondsSinceEpoch,
+        });
       }
     }
 
@@ -136,8 +143,17 @@ class NotificationTaskHandler extends TaskHandler {
       _connecting = false;
       _retryDelay = 2;
 
-      // If relay was previously flagged as down, fire restored alert.
+      // If relay was previously flagged as down, notify main isolate so it can
+      // retroactively POST the outage to the relay as a persistent list entry.
       if (_relayDownNotified) {
+        if (_relayDownSince != null) {
+          FlutterForegroundTask.sendDataToMain({
+            'type': 'relayOutage',
+            'downSince': _relayDownSince!.millisecondsSinceEpoch,
+            'restoredAt': DateTime.now().millisecondsSinceEpoch,
+          });
+          _relayDownSince = null;
+        }
         _fireRelayRestoredAlert();
       }
       _relayDownNotified = false;

@@ -31,6 +31,10 @@ class _HomeScreenState extends State<HomeScreen>
   final List<String> _debugLog = [];
   final _heartbeatKey = GlobalKey<HeartbeatStripState>();
 
+  // Placeholder ID for the optimistic relay-down entry. Must not collide with
+  // any real server notification ID (server uses AUTOINCREMENT starting at 1).
+  static const _sentinelId = -9001;
+
   static const _monthNames = [
     'January', 'February', 'March', 'April', 'May', 'June',
     'July', 'August', 'September', 'October', 'November', 'December',
@@ -114,6 +118,38 @@ class _HomeScreenState extends State<HomeScreen>
           final connected = msg['connected'] as bool? ?? false;
           setState(() => _wsConnected = connected);
           _heartbeatKey.currentState?.addBeat(connected);
+        case 'relayDown':
+          final downSince = msg['downSince'] as int?;
+          if (downSince == null) break;
+          // Idempotent: only insert if no sentinel already present.
+          if (_newNotifications.any((x) => x.id == _sentinelId) ||
+              _oldNotifications.any((x) => x.id == _sentinelId)) break;
+          setState(() => _newNotifications.insert(
+                0,
+                AppNotification(
+                  id: _sentinelId,
+                  title: 'andrNoti relay unreachable',
+                  text: 'Relay is down. Outage duration will be recorded on reconnection.',
+                  source: 'andrNoti',
+                  createdAt: DateTime.fromMillisecondsSinceEpoch(downSince),
+                  seenAt: null,
+                ),
+              ));
+        case 'relayOutage':
+          final downSince = msg['downSince'] as int?;
+          final restoredAt = msg['restoredAt'] as int?;
+          if (downSince != null && restoredAt != null) {
+            // Remove the optimistic sentinel — the real notification with
+            // duration arrives via WS broadcast after _postRelayOutage POSTs.
+            setState(() {
+              _newNotifications.removeWhere((x) => x.id == _sentinelId);
+              _oldNotifications.removeWhere((x) => x.id == _sentinelId);
+            });
+            _postRelayOutage(
+              DateTime.fromMillisecondsSinceEpoch(downSince),
+              DateTime.fromMillisecondsSinceEpoch(restoredAt),
+            );
+          }
         case 'debug':
           _log(msg['msg'] as String? ?? '');
       }
@@ -233,6 +269,34 @@ class _HomeScreenState extends State<HomeScreen>
         body: json.encode({'ids': [n.id]}),
       );
     } catch (_) {}
+  }
+
+  // ── Relay outage retroactive record ─────────────────────────────────────────
+
+  Future<void> _postRelayOutage(DateTime downSince, DateTime restoredAt) async {
+    final config = await AppConfig.load();
+    if (!config.isConfigured) return;
+    final duration = restoredAt.difference(downSince);
+    final mins = duration.inMinutes;
+    final secs = duration.inSeconds % 60;
+    final durationStr = mins > 0 ? '${mins}m ${secs}s' : '${secs}s';
+    _log('posting relay outage record: $durationStr');
+    try {
+      await http.post(
+        Uri.parse('${config.httpBase}/send'),
+        headers: {
+          'Authorization': 'Bearer ${config.token}',
+          'Content-Type': 'application/json',
+        },
+        body: json.encode({
+          'title': 'andrNoti relay was unreachable',
+          'text': 'Outage lasted $durationStr. Connection restored.',
+          'source': 'andrNoti',
+        }),
+      );
+    } catch (e) {
+      _log('_postRelayOutage error: $e');
+    }
   }
 
   // ── Clear history ───────────────────────────────────────────────────────────

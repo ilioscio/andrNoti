@@ -120,7 +120,7 @@ class _ConfigScreenState extends State<ConfigScreen> {
                 controller: _graceCtrl,
                 decoration: const InputDecoration(
                   labelText: 'Relay-down grace period (seconds)',
-                  hintText: '120',
+                  hintText: '60',
                   helperText: 'How long to wait before alerting on a lost relay connection.',
                   border: OutlineInputBorder(),
                 ),

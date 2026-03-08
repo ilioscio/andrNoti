@@ -15,7 +15,7 @@ class AppConfig {
     required this.serverUrl,
     required this.token,
     this.showDebugPanel = false,
-    this.relayDownGraceSeconds = 120,
+    this.relayDownGraceSeconds = 60,
   });
 
   bool get isConfigured => serverUrl.isNotEmpty && token.isNotEmpty;
@@ -35,7 +35,7 @@ class AppConfig {
       serverUrl:             prefs.getString(_keyServerUrl) ?? '',
       token:                 prefs.getString(_keyToken) ?? '',
       showDebugPanel:        prefs.getBool(_keyShowDebugPanel) ?? false,
-      relayDownGraceSeconds: prefs.getInt(_keyRelayDownGraceSeconds) ?? 120,
+      relayDownGraceSeconds: prefs.getInt(_keyRelayDownGraceSeconds) ?? 60,
     );
   }
 
