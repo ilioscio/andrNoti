@@ -657,14 +657,19 @@ class _HomeScreenState extends State<HomeScreen>
           if (_debugLog.isNotEmpty)
             ConstrainedBox(
               constraints: const BoxConstraints(maxHeight: 120),
-              child: SingleChildScrollView(
-                reverse: true,
-                child: Text(
-                  _debugLog.join('\n'),
-                  style: const TextStyle(
-                    color: Colors.greenAccent,
-                    fontFamily: 'monospace',
-                    fontSize: 10,
+              // Absorb scroll notifications so they don't bubble up to the
+              // AppBar and trigger its surface-colour scroll-under behaviour.
+              child: NotificationListener<ScrollNotification>(
+                onNotification: (_) => true,
+                child: SingleChildScrollView(
+                  reverse: true,
+                  child: Text(
+                    _debugLog.join('\n'),
+                    style: const TextStyle(
+                      color: Colors.greenAccent,
+                      fontFamily: 'monospace',
+                      fontSize: 10,
+                    ),
                   ),
                 ),
               ),

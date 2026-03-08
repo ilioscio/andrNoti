@@ -33,6 +33,13 @@ class HeartbeatStripState extends State<HeartbeatStrip>
 
   int _phase = 0; // animation phase counter for scrolling
 
+  // Spike samples queued for injection one-per-tick.
+  // Keeping them in a queue instead of pushing all at once means:
+  //   • The dot at samples.last rides the spike contour as it arrives.
+  //   • Buffered beats (e.g. after phone unlock) don't cause burst playback —
+  //     only one spike plays at a time; extras are discarded.
+  final List<_Sample> _spikeQueue = [];
+
   @override
   void initState() {
     super.initState();
@@ -58,27 +65,36 @@ class HeartbeatStripState extends State<HeartbeatStrip>
 
   void addBeat(bool connected) {
     if (!connected) {
+      _spikeQueue.clear(); // cancel pending spike if we just disconnected
       _push(_Sample(0.0, false));
       return;
     }
-    // Push the ECG spike shape
+    // Debounce: if a spike is already being injected, discard this beat.
+    // This prevents a burst of buffered beats (e.g. after phone unlock)
+    // from producing multiple rapid spikes.
+    if (_spikeQueue.isNotEmpty) return;
     for (var i = 0; i < _spikeDuration; i++) {
-      _push(_Sample(_spikeShape[i], true));
+      _spikeQueue.add(_Sample(_spikeShape[i], true));
     }
   }
 
   // --- internals ---
 
   void _tick() {
-    // Drive gentle "idle" scrolling — push one sample per ~4 ticks
+    // Drive scrolling — push one sample per ~4 ticks (~15 samples/sec).
     _phase++;
     if (_phase % 4 == 0) {
-      // If the last sample is live and flat (between beats), push a small sine ripple
-      final last = _samples.isNotEmpty ? _samples.last : null;
-      final amp = (last != null && last.live)
-          ? 0.04 * sin(_phase * 0.18)
-          : 0.0;
-      _push(_Sample(amp, last?.live ?? false));
+      if (_spikeQueue.isNotEmpty) {
+        // Inject next spike sample so the dot rides the contour as it arrives.
+        _push(_spikeQueue.removeAt(0));
+      } else {
+        // Idle: gentle sine ripple when live, flat when dead.
+        final last = _samples.isNotEmpty ? _samples.last : null;
+        final amp = (last != null && last.live)
+            ? 0.04 * sin(_phase * 0.18)
+            : 0.0;
+        _push(_Sample(amp, last?.live ?? false));
+      }
     }
     setState(() {});
   }

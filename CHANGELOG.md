@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.4.5] — 2026-03-08
+
+### Android App
+- **Heartbeat strip — dot follows spike contour**: spike samples are now queued
+  and injected one-per-tick instead of pushed all at once. The leading dot at
+  `samples.last` now rides up and over the spike as it arrives from the right,
+  giving a true oscilloscope-scan appearance rather than the spike appearing
+  instantaneously to the left of a stationary dot.
+- **Heartbeat strip — no buffered burst on unlock**: same queue change means
+  only one spike plays at a time. Beats that arrive in a burst (e.g. multiple
+  heartbeat events delivered after the phone screen wakes) are debounced —
+  subsequent beats while a spike is queued are discarded.
+- **AppBar colour stable while debug console scrolls**: wrapped the debug
+  panel's `SingleChildScrollView` in a `NotificationListener<ScrollNotification>`
+  that absorbs events (`onNotification: (_) => true`). Previously, scrolling
+  the debug log caused the AppBar/TabBar background to switch from
+  `colorScheme.surface` to `colorScheme.surfaceContainer` (Flutter M3
+  scroll-under behaviour), making it appear lighter.
+
+## [0.4.4] — 2026-03-08
+
+### Android App
+- **Relay-down notification in New tab**: when the relay-down grace period
+  fires, an optimistic sentinel notification (`id = -9001`, source "andrNoti")
+  is inserted into the New tab immediately — no server round-trip needed. On
+  reconnection the sentinel is removed and replaced by a real server
+  notification (posted via `POST /send`) that includes the exact outage
+  duration, persists in SQLite history, and can be swiped to archive normally.
+- **Grace period default 120 s → 60 s**: `relayDownGraceSeconds` default
+  reduced in `AppConfig`, `NotificationTaskHandler`, and the Settings screen
+  hint text.
+
 ## [0.4.1] — 2026-03-07
 
 ### Android App

@@ -157,8 +157,10 @@ inserts an alert notification and broadcasts it to the app.
 **Alert flow:**
 - Source goes silent → relay alerts after `interval × heartbeatMissed` seconds
 - Source comes back → relay sends a recovery notification automatically
-- Relay itself goes down → app fires a local Android notification after a
-  configurable grace period (default 120s), no server involvement needed
+- Relay itself goes down → app inserts an entry in the New tab and fires a
+  local Android notification after a configurable grace period (default 60s);
+  on reconnection the entry is replaced by a server record with exact outage
+  duration, no server involvement needed during the outage itself
 
 ### Option A — NixOS flake
 
@@ -270,7 +272,8 @@ Configure in the app's Settings screen:
 - **Server WebSocket URL** — `wss://notify.example.com/ws`
 - **Auth Token** — the same token the relay server uses
 - **Relay-down grace period** — seconds to wait before firing a local
-  "relay unreachable" notification (default 120s)
+  "relay unreachable" notification and inserting an entry in the New tab
+  (default 60s)
 
 ---
 
