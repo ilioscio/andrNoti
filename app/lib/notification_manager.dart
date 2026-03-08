@@ -56,13 +56,19 @@ class NotificationTaskHandler extends TaskHandler {
   bool _stopped = false;
   bool _connecting = false;
 
+  // Relay-down tracking
+  DateTime? _disconnectedSince;
+  bool _relayDownNotified = false;
+  int _graceSeconds = 120;
+
   late AppConfig _config;
 
   @override
   Future<void> onStart(DateTime timestamp, TaskStarter starter) async {
     _dbg('onStart called');
     _config = await AppConfig.load();
-    _dbg('config: url="${_config.serverUrl}" configured=${_config.isConfigured}');
+    _graceSeconds = _config.relayDownGraceSeconds;
+    _dbg('config: url="${_config.serverUrl}" configured=${_config.isConfigured} grace=${_graceSeconds}s');
     if (_config.isConfigured) {
       await _connect();
     }
@@ -70,6 +76,22 @@ class NotificationTaskHandler extends TaskHandler {
 
   @override
   void onRepeatEvent(DateTime timestamp) {
+    FlutterForegroundTask.sendDataToMain({
+      'type': 'heartbeat',
+      'connected': _ws != null && !_stopped,
+      'ts': timestamp.millisecondsSinceEpoch,
+    });
+
+    // Relay-down grace period check
+    if (_disconnectedSince != null && !_relayDownNotified) {
+      final elapsed = DateTime.now().difference(_disconnectedSince!).inSeconds;
+      if (elapsed >= _graceSeconds) {
+        _dbg('relay down for ${elapsed}s — firing local notification');
+        _fireRelayDownAlert();
+        _relayDownNotified = true;
+      }
+    }
+
     if (!_stopped && _ws == null && !_connecting) {
       _dbg('onRepeatEvent: ws null, reconnecting');
       _connect();
@@ -90,7 +112,12 @@ class NotificationTaskHandler extends TaskHandler {
       _config = AppConfig(
         serverUrl: data['serverUrl'] as String,
         token: data['token'] as String,
+        relayDownGraceSeconds: (data['graceSeconds'] as int?) ?? _graceSeconds,
       );
+      _graceSeconds = _config.relayDownGraceSeconds;
+      // Reset relay-down state when user deliberately changes settings.
+      _disconnectedSince = null;
+      _relayDownNotified = false;
       _ws?.close();
       _ws = null;
       _connecting = false;
@@ -108,6 +135,19 @@ class NotificationTaskHandler extends TaskHandler {
       _dbg('_connect: handshake OK, readyState=${_ws!.readyState}');
       _connecting = false;
       _retryDelay = 2;
+
+      // If relay was previously flagged as down, fire restored alert.
+      if (_relayDownNotified) {
+        _fireRelayRestoredAlert();
+      }
+      _relayDownNotified = false;
+      _disconnectedSince = null;
+
+      FlutterForegroundTask.sendDataToMain({
+        'type': 'heartbeat',
+        'connected': true,
+        'ts': DateTime.now().millisecondsSinceEpoch,
+      });
       FlutterForegroundTask.updateService(
         notificationTitle: 'andrNoti',
         notificationText: 'Connected',
@@ -122,6 +162,7 @@ class NotificationTaskHandler extends TaskHandler {
       _dbg('_connect failed: $e');
       _ws = null;
       _connecting = false;
+      _disconnectedSince ??= DateTime.now(); // track when we first started failing
       _scheduleReconnect();
     }
   }
@@ -131,6 +172,12 @@ class NotificationTaskHandler extends TaskHandler {
     _ws?.close().ignore(); // send close frame so the server drops us immediately
     _ws = null;
     _connecting = false;
+    _disconnectedSince ??= DateTime.now(); // preserve first disconnect time
+    FlutterForegroundTask.sendDataToMain({
+      'type': 'heartbeat',
+      'connected': false,
+      'ts': DateTime.now().millisecondsSinceEpoch,
+    });
     _dbg('reconnect in ${_retryDelay}s');
     FlutterForegroundTask.updateService(
       notificationTitle: 'andrNoti',
@@ -185,6 +232,43 @@ class NotificationTaskHandler extends TaskHandler {
       payload: n.id.toString(),
     ).catchError((e) => _dbg('_showAlert error: $e'));
   }
+
+  // Fixed ID for relay status notifications so they replace each other.
+  static const _relayNotifId = 9001;
+
+  void _fireRelayDownAlert() {
+    _localNotifications.show(
+      _relayNotifId,
+      'andrNoti relay unreachable',
+      'No connection for ${_graceSeconds}s. Check server or network.',
+      NotificationDetails(
+        android: AndroidNotificationDetails(
+          _androidChannel.id,
+          _androidChannel.name,
+          channelDescription: _androidChannel.description,
+          importance: Importance.high,
+          priority: Priority.high,
+        ),
+      ),
+    ).catchError((e) => _dbg('relay-down alert error: $e'));
+  }
+
+  void _fireRelayRestoredAlert() {
+    _localNotifications.show(
+      _relayNotifId,
+      'andrNoti relay reconnected',
+      'Connection restored.',
+      NotificationDetails(
+        android: AndroidNotificationDetails(
+          _androidChannel.id,
+          _androidChannel.name,
+          channelDescription: _androidChannel.description,
+          importance: Importance.defaultImportance,
+          priority: Priority.defaultPriority,
+        ),
+      ),
+    ).catchError((e) => _dbg('relay-restored alert error: $e'));
+  }
 }
 
 // ── Service control ───────────────────────────────────────────────────────────
@@ -232,12 +316,14 @@ void _startCallback() {
 Future<ServiceRequestResult> restartForegroundService({
   required String serverUrl,
   required String token,
+  required int relayDownGraceSeconds,
 }) async {
   if (await FlutterForegroundTask.isRunningService) {
     FlutterForegroundTask.sendDataToTask({
       'cmd': 'reconnect',
       'serverUrl': serverUrl,
       'token': token,
+      'graceSeconds': relayDownGraceSeconds,
     });
     return FlutterForegroundTask.restartService();
   } else {

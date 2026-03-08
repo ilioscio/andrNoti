@@ -6,6 +6,7 @@ import 'package:flutter_foreground_task/models/service_request_result.dart';
 import 'package:http/http.dart' as http;
 
 import 'config.dart';
+import 'heartbeat_strip.dart';
 import 'models.dart';
 import 'notification_manager.dart';
 
@@ -26,7 +27,9 @@ class _HomeScreenState extends State<HomeScreen>
   String? _error;
   bool? _serviceRunning;
   bool _showDebugPanel = false;
+  bool _wsConnected = false;
   final List<String> _debugLog = [];
+  final _heartbeatKey = GlobalKey<HeartbeatStripState>();
 
   static const _monthNames = [
     'January', 'February', 'March', 'April', 'May', 'June',
@@ -92,6 +95,7 @@ class _HomeScreenState extends State<HomeScreen>
           final n = AppNotification.fromJson(msg);
           notificationStore[n.id] = n;
           setState(() => _newNotifications.insert(0, n));
+          _heartbeatKey.currentState?.addBeat(true);
         case 'history':
           final all = (msg['notifications'] as List? ?? [])
               .map((e) => AppNotification.fromJson(e as Map<String, dynamic>))
@@ -101,6 +105,10 @@ class _HomeScreenState extends State<HomeScreen>
             _oldNotifications = all.where((n) => n.seenAt != null).toList();
             _loading = false;
           });
+        case 'heartbeat':
+          final connected = msg['connected'] as bool? ?? false;
+          setState(() => _wsConnected = connected);
+          _heartbeatKey.currentState?.addBeat(connected);
         case 'debug':
           _log(msg['msg'] as String? ?? '');
       }
@@ -284,6 +292,29 @@ class _HomeScreenState extends State<HomeScreen>
         centerTitle: false,
         title: Image.asset('assets/IconWhite.png', height: 32),
         actions: [
+          GestureDetector(
+            onTap: () => setState(() => _showDebugPanel = !_showDebugPanel),
+            child: Tooltip(
+              message: _wsConnected ? 'Connected — tap for diagnostics' : 'Disconnected — tap for diagnostics',
+              child: Container(
+                width: 10,
+                height: 10,
+                margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 16),
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: _wsConnected ? const Color(0xFF00FF80) : Colors.red,
+                  boxShadow: [
+                    BoxShadow(
+                      color: (_wsConnected ? const Color(0xFF00FF80) : Colors.red)
+                          .withOpacity(0.7),
+                      blurRadius: 6,
+                      spreadRadius: 2,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
           IconButton(
             icon: const Icon(Icons.settings_outlined),
             tooltip: 'Settings',
@@ -305,7 +336,17 @@ class _HomeScreenState extends State<HomeScreen>
       ),
       body: Column(
         children: [
-          if (_showDebugPanel) _buildDebugPanel(),
+          Visibility(
+            visible: _showDebugPanel,
+            maintainState: true,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                HeartbeatStrip(key: _heartbeatKey),
+                _buildDebugPanel(),
+              ],
+            ),
+          ),
           Expanded(child: _buildBody()),
         ],
       ),
@@ -375,9 +416,16 @@ class _HomeScreenState extends State<HomeScreen>
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
               ),
-              subtitle: n.title.isNotEmpty
-                  ? Text(n.text, maxLines: 2, overflow: TextOverflow.ellipsis)
-                  : null,
+              subtitle: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (n.title.isNotEmpty)
+                    Text(n.text, maxLines: 2, overflow: TextOverflow.ellipsis),
+                  if (n.source.isNotEmpty)
+                    _SourceChip(n.source),
+                ],
+              ),
               trailing: Text(
                 _relativeTime(n.createdAt),
                 style: Theme.of(context).textTheme.bodySmall,
@@ -476,9 +524,16 @@ class _HomeScreenState extends State<HomeScreen>
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
             ),
-            subtitle: n.title.isNotEmpty
-                ? Text(n.text, maxLines: 1, overflow: TextOverflow.ellipsis)
-                : null,
+            subtitle: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (n.title.isNotEmpty)
+                  Text(n.text, maxLines: 1, overflow: TextOverflow.ellipsis),
+                if (n.source.isNotEmpty)
+                  _SourceChip(n.source),
+              ],
+            ),
             trailing: Text(
               _relativeTime(n.createdAt),
               style: Theme.of(context).textTheme.bodySmall,
@@ -544,6 +599,33 @@ class _HomeScreenState extends State<HomeScreen>
               ),
             ),
         ],
+      ),
+    );
+  }
+}
+
+// ── Source chip ───────────────────────────────────────────────────────────────
+
+class _SourceChip extends StatelessWidget {
+  final String source;
+  const _SourceChip(this.source);
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 2),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+        decoration: BoxDecoration(
+          color: Theme.of(context).colorScheme.surfaceContainerHighest,
+          borderRadius: BorderRadius.circular(4),
+        ),
+        child: Text(
+          source,
+          style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+        ),
       ),
     );
   }

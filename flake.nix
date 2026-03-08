@@ -22,7 +22,7 @@
           # ── Go server ──────────────────────────────────────────────────────
           serverPkg = pkgs.buildGoModule {
             pname   = "andr-noti";
-            version = "0.3.1";
+            version = "0.4.0";
             src     = ./server;
 
             vendorHash = "sha256-M16ieYmUqzWJm5ZWFu4ISVD4553EHh31wT8oH1sJZX4=";
@@ -204,97 +204,196 @@
                 '';
               };
 
+              heartbeatMissed = lib.mkOption {
+                type        = lib.types.ints.positive;
+                default     = 3;
+                description = "Number of missed beats before alerting on a remote source.";
+              };
+
               package = lib.mkOption {
                 type        = lib.types.package;
                 default     = self.packages.${pkgs.system}.default;
                 defaultText = lib.literalExpression "andrNoti.packages.\${system}.default";
                 description = "The andr-noti server package to use.";
               };
-            };
 
-            config = lib.mkIf cfg.enable {
-              assertions = [
-                {
-                  assertion = cfg.tokenFile != null || cfg.token != null;
-                  message   = "services.andrNoti: set either tokenFile or token.";
-                }
-                {
-                  assertion = !(cfg.tokenFile != null && cfg.token != null);
-                  message   = "services.andrNoti: set only one of tokenFile or token, not both.";
-                }
-              ];
+              # ── Heartbeat sender (for remote servers) ─────────────────────
+              heartbeat = {
+                enable = lib.mkEnableOption "andrNoti heartbeat sender — registers this machine with a relay server";
 
-              users.users.andr-noti = {
-                isSystemUser = true;
-                group        = "andr-noti";
-                description  = "andrNoti notification server";
-              };
-              users.groups.andr-noti = {};
-
-              systemd.services.andr-noti = {
-                description = "andrNoti push notification server";
-                after       = [ "network.target" ];
-                wantedBy    = [ "multi-user.target" ];
-
-                serviceConfig = {
-                  Type           = "simple";
-                  User           = "andr-noti";
-                  Group          = "andr-noti";
-                  StateDirectory = "andr-noti";
-                  ExecStart      = lib.concatStringsSep " " (
-                    [
-                      "${cfg.package}/bin/andr-noti"
-                      "--port ${toString cfg.port}"
-                      "--db /var/lib/andr-noti/notifications.db"
-                    ] ++ (
-                      if cfg.tokenFile != null
-                      then [ "--token-file ${cfg.tokenFile}" ]
-                      else [ "--token ${cfg.token}" ]
-                    )
-                  );
-                  Restart    = "always";
-                  RestartSec = 5;
-
-                  # Hardening
-                  NoNewPrivileges = true;
-                  ProtectSystem   = "strict";
-                  ProtectHome     = true;
-                  PrivateTmp      = true;
-                  ReadWritePaths  = [ "/var/lib/andr-noti" ];
+                source = lib.mkOption {
+                  type        = lib.types.str;
+                  example     = "work-server";
+                  description = "Name identifying this machine in heartbeat and alert messages.";
                 };
-              };
 
-              services.nginx.commonHttpConfig = lib.mkIf (cfg.hostname != null) ''
-                limit_req_zone $binary_remote_addr zone=andrnoti_ws:1m rate=5r/s;
-              '';
+                relayUrl = lib.mkOption {
+                  type        = lib.types.str;
+                  example     = "https://notify.example.com";
+                  description = "HTTP/HTTPS base URL of the andrNoti relay server (no trailing slash).";
+                };
 
-              services.nginx.virtualHosts = lib.mkIf (cfg.hostname != null) {
-                ${cfg.hostname} = {
-                  enableACME = true;
-                  forceSSL   = true;
+                interval = lib.mkOption {
+                  type        = lib.types.ints.positive;
+                  default     = 60;
+                  description = "Heartbeat interval in seconds. The timer fires at this cadence.";
+                };
 
-                  locations."/" = {
-                    proxyPass   = "http://127.0.0.1:${toString cfg.port}";
-                    extraConfig = ''
-                      proxy_set_header X-Forwarded-For   $remote_addr;
-                      proxy_set_header X-Forwarded-Proto $scheme;
-                    '';
-                  };
+                tokenFile = lib.mkOption {
+                  type        = lib.types.nullOr lib.types.path;
+                  default     = null;
+                  description = "Path to file containing the relay auth token (e.g. from agenix).";
+                };
 
-                  locations."/ws" = {
-                    proxyPass   = "http://127.0.0.1:${toString cfg.port}";
-                    extraConfig = ''
-                      limit_req zone=andrnoti_ws burst=10 nodelay;
-                      proxy_http_version 1.1;
-                      proxy_set_header Upgrade    $http_upgrade;
-                      proxy_set_header Connection "upgrade";
-                      proxy_read_timeout  3600s;
-                      proxy_send_timeout  3600s;
-                    '';
-                  };
+                token = lib.mkOption {
+                  type        = lib.types.nullOr lib.types.str;
+                  default     = null;
+                  description = "Relay auth token as plain string. Prefer tokenFile for production.";
                 };
               };
             };
+
+            config = lib.mkMerge [
+
+              # ── Relay server ───────────────────────────────────────────────
+              (lib.mkIf cfg.enable {
+                assertions = [
+                  {
+                    assertion = cfg.tokenFile != null || cfg.token != null;
+                    message   = "services.andrNoti: set either tokenFile or token.";
+                  }
+                  {
+                    assertion = !(cfg.tokenFile != null && cfg.token != null);
+                    message   = "services.andrNoti: set only one of tokenFile or token, not both.";
+                  }
+                ];
+
+                users.users.andr-noti = {
+                  isSystemUser = true;
+                  group        = "andr-noti";
+                  description  = "andrNoti notification server";
+                };
+                users.groups.andr-noti = {};
+
+                systemd.services.andr-noti = {
+                  description = "andrNoti push notification server";
+                  after       = [ "network.target" ];
+                  wantedBy    = [ "multi-user.target" ];
+
+                  serviceConfig = {
+                    Type           = "simple";
+                    User           = "andr-noti";
+                    Group          = "andr-noti";
+                    StateDirectory = "andr-noti";
+                    ExecStart      = lib.concatStringsSep " " (
+                      [
+                        "${cfg.package}/bin/andr-noti"
+                        "--port ${toString cfg.port}"
+                        "--db /var/lib/andr-noti/notifications.db"
+                        "--heartbeat-missed ${toString cfg.heartbeatMissed}"
+                      ] ++ (
+                        if cfg.tokenFile != null
+                        then [ "--token-file ${cfg.tokenFile}" ]
+                        else [ "--token ${cfg.token}" ]
+                      )
+                    );
+                    Restart    = "always";
+                    RestartSec = 5;
+
+                    # Hardening
+                    NoNewPrivileges = true;
+                    ProtectSystem   = "strict";
+                    ProtectHome     = true;
+                    PrivateTmp      = true;
+                    ReadWritePaths  = [ "/var/lib/andr-noti" ];
+                  };
+                };
+
+                services.nginx.commonHttpConfig = lib.mkIf (cfg.hostname != null) ''
+                  limit_req_zone $binary_remote_addr zone=andrnoti_ws:1m rate=5r/s;
+                '';
+
+                services.nginx.virtualHosts = lib.mkIf (cfg.hostname != null) {
+                  ${cfg.hostname} = {
+                    enableACME = true;
+                    forceSSL   = true;
+
+                    locations."/" = {
+                      proxyPass   = "http://127.0.0.1:${toString cfg.port}";
+                      extraConfig = ''
+                        proxy_set_header X-Forwarded-For   $remote_addr;
+                        proxy_set_header X-Forwarded-Proto $scheme;
+                      '';
+                    };
+
+                    locations."/ws" = {
+                      proxyPass   = "http://127.0.0.1:${toString cfg.port}";
+                      extraConfig = ''
+                        limit_req zone=andrnoti_ws burst=10 nodelay;
+                        proxy_http_version 1.1;
+                        proxy_set_header Upgrade    $http_upgrade;
+                        proxy_set_header Connection "upgrade";
+                        proxy_read_timeout  3600s;
+                        proxy_send_timeout  3600s;
+                      '';
+                    };
+                  };
+                };
+              })
+
+              # ── Heartbeat sender ───────────────────────────────────────────
+              (lib.mkIf cfg.heartbeat.enable {
+                assertions = [
+                  {
+                    assertion = cfg.heartbeat.tokenFile != null || cfg.heartbeat.token != null;
+                    message   = "services.andrNoti.heartbeat: set either tokenFile or token.";
+                  }
+                  {
+                    assertion = !(cfg.heartbeat.tokenFile != null && cfg.heartbeat.token != null);
+                    message   = "services.andrNoti.heartbeat: set only one of tokenFile or token, not both.";
+                  }
+                ];
+
+                systemd.services.andr-noti-heartbeat = {
+                  description     = "andrNoti heartbeat ping to relay";
+                  after           = [ "network-online.target" ];
+                  wants           = [ "network-online.target" ];
+                  serviceConfig = {
+                    Type            = "oneshot";
+                    NoNewPrivileges = true;
+                    ProtectSystem   = "strict";
+                    ProtectHome     = true;
+                    ExecStart       =
+                      let
+                        tokenExpr =
+                          if cfg.heartbeat.tokenFile != null
+                          then ''$(cat ${cfg.heartbeat.tokenFile})''
+                          else cfg.heartbeat.token;
+                      in
+                        pkgs.writeShellScript "andr-noti-heartbeat" ''
+                          ${pkgs.curl}/bin/curl -sf \
+                            -X POST "${cfg.heartbeat.relayUrl}/heartbeat" \
+                            -H "Authorization: Bearer ${tokenExpr}" \
+                            -H "Content-Type: application/json" \
+                            -d '{"source":"${cfg.heartbeat.source}","interval":${toString cfg.heartbeat.interval}}' \
+                            || true
+                        '';
+                  };
+                };
+
+                systemd.timers.andr-noti-heartbeat = {
+                  description = "andrNoti heartbeat timer";
+                  wantedBy    = [ "timers.target" ];
+                  timerConfig = {
+                    OnBootSec         = "30s";
+                    OnUnitActiveSec   = "${toString cfg.heartbeat.interval}s";
+                    AccuracySec       = "10s";
+                    Persistent        = true;
+                  };
+                };
+              })
+
+            ];
           };
 
         # ── Overlay ────────────────────────────────────────────────────────────

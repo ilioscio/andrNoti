@@ -1,5 +1,71 @@
 # Changelog
 
+## [0.4.0] — 2026-03-07
+
+### Server
+- **Source tagging**: `POST /send` accepts optional `"source"` field; stored in
+  `notifications` table (new `source TEXT NOT NULL DEFAULT ''` column, migrated
+  safely with `ALTER TABLE`). Forwarded in WebSocket messages and history JSON.
+- **Heartbeat monitoring**: new `POST /heartbeat` endpoint (Bearer auth). Body:
+  `{"source":"name","interval":60}`. Auto-registers on first call; upserts
+  `last_seen` on every call. If source was previously alerted as down, fires a
+  recovery notification and resets `alerted` flag.
+- **Heartbeat checker**: background goroutine (runs every minute). Queries
+  `heartbeats` table; for each source where `now - last_seen > interval ×
+  missed_threshold`, inserts a "source unreachable" notification, broadcasts to
+  WebSocket clients, sets `alerted=1`. Threshold configurable via
+  `--heartbeat-missed` flag (default 3).
+- **`heartbeats` table**: `source TEXT PRIMARY KEY, interval INTEGER, last_seen
+  DATETIME, alerted INTEGER`. Created on startup if not present.
+- **`--heartbeat-missed`** flag added to server.
+
+### Android App
+- **Relay-down detection**: `NotificationTaskHandler` tracks `_disconnectedSince`
+  from the first failed connection attempt. After `_graceSeconds` of continuous
+  failure, fires a local Android notification "andrNoti relay unreachable" (ID
+  9001). On successful reconnect, replaces it with "relay reconnected". The dot
+  indicator in the AppBar updates immediately on connect/disconnect.
+- **Grace period configurable**: new `relayDownGraceSeconds` setting in the
+  Settings screen (default 120s, minimum 15s). Passed to the task isolate via
+  the reconnect command so the running service picks it up without restart.
+- **Source shown in UI**: notification list tiles show a small source chip below
+  the text when `source` is non-empty. Detail screen shows source chip next to
+  the timestamp.
+- `AppNotification.source` field added; `fromJson` reads `source` key.
+
+### NixOS Module
+- **`services.andrNoti.heartbeatMissed`** option (default 3) passed as
+  `--heartbeat-missed` to the server.
+- **`services.andrNoti.heartbeat.*`** sub-options for remote heartbeat sender:
+  - `enable`, `source`, `relayUrl`, `interval` (default 60s), `tokenFile`,
+    `token` (mutually exclusive, both with assertions)
+  - Creates `andr-noti-heartbeat.service` (oneshot curl to `/heartbeat`) +
+    `andr-noti-heartbeat.timer` (fires every `interval` seconds, first run 30s
+    after boot, `Persistent=true`)
+  - Can be used independently (no relay server on the same machine needed)
+
+### Infrastructure (ilios.dev)
+- `andr-notify` CLI in `flake.nix` updated to include `"source":"ilios.dev"`.
+- `alerts.nix`: `notify` helper and `diskCheckScript` updated to include
+  `"source":"ilios.dev"` in all POSTs.
+
+## [0.3.2] — 2026-03-07
+
+### Android App
+- **Heartbeat ECG widget**: scrolling ECG-style graph (green glowing line on
+  black background) shows live WebSocket keep-alive pulse. Tapping the dot
+  indicator in the AppBar toggles the panel (heartbeat strip + debug console).
+- **AppBar dot indicator**: small circle, green (connected) or red
+  (disconnected), with glow effect. Sits left of the settings icon.
+- Heartbeat events emitted by `NotificationTaskHandler` on every `onRepeatEvent`
+  (15s), plus immediately on connect and disconnect — dot updates without waiting
+  for the next repeat cycle.
+- `HeartbeatStrip` (`heartbeat_strip.dart`): `CustomPainter` with glow passes
+  (3 stroke widths/opacities), ECG spike on beat, idle sinusoidal ripple between
+  beats, dim red flat line during disconnection.
+- Panel uses `Visibility(maintainState: true)` so the strip accumulates samples
+  even while hidden.
+
 ## [0.3.0] — 2026-03-03
 
 ### Server
@@ -168,6 +234,28 @@
    install (Android rejects equal or lower build numbers)
 3. Commit and push to `github:ilioscio/andrNoti`
 4. In `ilios.dev/`: `nix flake update andrNoti` then `nix run .`
+
+### Adding a remote heartbeat sender (NixOS)
+In the remote machine's NixOS config, import the andrNoti flake and add:
+```nix
+services.andrNoti.heartbeat = {
+  enable    = true;
+  source    = "my-server";          # shown in alert titles
+  relayUrl  = "https://notify.ilios.dev";
+  interval  = 60;                   # seconds between heartbeats
+  tokenFile = config.age.secrets.andr-noti-token.path;
+  # OR: token = "plaintext-token";  (less secure)
+};
+```
+The timer fires every `interval` seconds and `Persistent=true` catches up on
+missed beats after downtime. First beat fires 30s after boot.
+
+### Source field
+- `POST /send` body: `{"title":"...","text":"...","source":"my-server"}`
+- `POST /heartbeat` body: `{"source":"my-server","interval":60}`
+- Empty `source` is valid (legacy notifications); shown as no chip in the app.
+- `"source":"andrNoti"` is reserved for relay-generated system notifications
+  (heartbeat alerts, recovery notifications).
 
 ### APK install
 - Install over the top (no uninstall needed) as long as the signing key is
