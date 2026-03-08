@@ -128,6 +128,7 @@ class NotificationTaskHandler extends TaskHandler {
 
   void _scheduleReconnect() {
     if (_stopped) return;
+    _ws?.close().ignore(); // send close frame so the server drops us immediately
     _ws = null;
     _connecting = false;
     _dbg('reconnect in ${_retryDelay}s');
