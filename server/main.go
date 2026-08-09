@@ -89,14 +89,16 @@ func initDB(path string) error {
 			interval  INTEGER NOT NULL DEFAULT 60,
 			last_seen DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			alerted   INTEGER NOT NULL DEFAULT 0,
-			health    TEXT
+			health    TEXT,
+			monitor   INTEGER NOT NULL DEFAULT 1
 		)
 	`)
 	if err != nil {
 		return err
 	}
-	// Safe migration — adds the health payload column to pre-existing tables.
+	// Safe migrations — silently ignored if columns already exist.
 	_, _ = db.Exec(`ALTER TABLE heartbeats ADD COLUMN health TEXT`)
+	_, _ = db.Exec(`ALTER TABLE heartbeats ADD COLUMN monitor INTEGER NOT NULL DEFAULT 1`)
 	return nil
 }
 
@@ -281,7 +283,7 @@ func startHeartbeatChecker(h *hub, missedThreshold int) {
 
 func checkHeartbeats(h *hub, missedThreshold int) {
 	rows, err := db.Query(
-		`SELECT source, interval, last_seen, alerted FROM heartbeats`,
+		`SELECT source, interval, last_seen, alerted, monitor FROM heartbeats`,
 	)
 	if err != nil {
 		log.Printf("heartbeat check: %v", err)
@@ -294,6 +296,7 @@ func checkHeartbeats(h *hub, missedThreshold int) {
 		interval int
 		lastSeen time.Time
 		alerted  bool
+		monitor  bool
 	}
 	var sources []hbRow
 
@@ -303,8 +306,9 @@ func checkHeartbeats(h *hub, missedThreshold int) {
 			interval    int
 			lastSeenStr string
 			alertedInt  int
+			monitorInt  int
 		)
-		if err := rows.Scan(&source, &interval, &lastSeenStr, &alertedInt); err != nil {
+		if err := rows.Scan(&source, &interval, &lastSeenStr, &alertedInt, &monitorInt); err != nil {
 			continue
 		}
 		t, err := parseSQLiteTime(lastSeenStr)
@@ -317,6 +321,7 @@ func checkHeartbeats(h *hub, missedThreshold int) {
 			interval: interval,
 			lastSeen: t,
 			alerted:  alertedInt != 0,
+			monitor:  monitorInt != 0,
 		})
 	}
 
@@ -324,7 +329,9 @@ func checkHeartbeats(h *hub, missedThreshold int) {
 		deadline := hb.lastSeen.Add(time.Duration(hb.interval*missedThreshold) * time.Second)
 		isDown := time.Now().UTC().After(deadline)
 
-		if isDown && !hb.alerted {
+		// monitor=false → intermittent device (e.g. a laptop): track status but
+		// never fire unreachable/recovered alerts.
+		if isDown && !hb.alerted && hb.monitor {
 			silence := time.Since(hb.lastSeen).Round(time.Second)
 			n, err := insertNotification(
 				hb.source+" unreachable",
@@ -403,6 +410,7 @@ func handleHeartbeat(h *hub) http.HandlerFunc {
 			Source   string          `json:"source"`
 			Interval int             `json:"interval"`
 			Health   json.RawMessage `json:"health,omitempty"`
+			Monitor  *bool           `json:"monitor,omitempty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
@@ -415,6 +423,11 @@ func handleHeartbeat(h *hub) http.HandlerFunc {
 		if body.Interval <= 0 {
 			body.Interval = 60
 		}
+		// Absent monitor defaults to true (alert on miss).
+		monitor := 1
+		if body.Monitor != nil && !*body.Monitor {
+			monitor = 0
+		}
 
 		// Check if this source was previously marked as down.
 		var alertedInt int
@@ -426,13 +439,14 @@ func handleHeartbeat(h *hub) http.HandlerFunc {
 
 		// Upsert — resets last_seen and clears alerted.
 		_, err := db.Exec(`
-			INSERT INTO heartbeats (source, interval, last_seen, alerted)
-			VALUES (?, ?, CURRENT_TIMESTAMP, 0)
+			INSERT INTO heartbeats (source, interval, last_seen, alerted, monitor)
+			VALUES (?, ?, CURRENT_TIMESTAMP, 0, ?)
 			ON CONFLICT(source) DO UPDATE SET
 				interval  = excluded.interval,
 				last_seen = CURRENT_TIMESTAMP,
-				alerted   = 0
-		`, body.Source, body.Interval)
+				alerted   = 0,
+				monitor   = excluded.monitor
+		`, body.Source, body.Interval, monitor)
 		if err != nil {
 			log.Printf("heartbeat: upsert %q: %v", body.Source, err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
@@ -572,6 +586,7 @@ type MachineInfo struct {
 	LastSeen           string          `json:"last_seen"`
 	Status             string          `json:"status"` // live | stale | down | unknown
 	Alerted            bool            `json:"alerted"`
+	Monitor            bool            `json:"monitor"` // false = intermittent, no down/up alerts
 	Health             json.RawMessage `json:"health,omitempty"`
 	NotificationCount  int             `json:"notification_count"`
 	LastNotificationAt string          `json:"last_notification_at,omitempty"`
@@ -606,7 +621,7 @@ func handleMachines(missedThreshold int) http.HandlerFunc {
 		order := []string{}
 
 		hbRows, err := db.Query(
-			`SELECT source, interval, last_seen, alerted, COALESCE(health, '') FROM heartbeats`,
+			`SELECT source, interval, last_seen, alerted, monitor, COALESCE(health, '') FROM heartbeats`,
 		)
 		if err != nil {
 			log.Printf("machines: query heartbeats: %v", err)
@@ -619,9 +634,10 @@ func handleMachines(missedThreshold int) http.HandlerFunc {
 				interval   int
 				lastSeen   string
 				alertedInt int
+				monitorInt int
 				health     string
 			)
-			if err := hbRows.Scan(&source, &interval, &lastSeen, &alertedInt, &health); err != nil {
+			if err := hbRows.Scan(&source, &interval, &lastSeen, &alertedInt, &monitorInt, &health); err != nil {
 				continue
 			}
 			mi := &MachineInfo{
@@ -631,6 +647,7 @@ func handleMachines(missedThreshold int) http.HandlerFunc {
 				LastSeen: lastSeen,
 				Status:   machineStatus(lastSeen, interval, missedThreshold),
 				Alerted:  alertedInt != 0,
+				Monitor:  monitorInt != 0,
 			}
 			if health != "" {
 				mi.Health = json.RawMessage(health)

@@ -22,7 +22,7 @@
           # ── Go server ──────────────────────────────────────────────────────
           serverPkg = pkgs.buildGoModule {
             pname   = "aisthetron";
-            version = "0.5.1";
+            version = "0.5.2";
             src     = ./server;
 
             vendorHash = "sha256-M16ieYmUqzWJm5ZWFu4ISVD4553EHh31wT8oH1sJZX4=";
@@ -247,6 +247,16 @@
                   description = "Heartbeat interval in seconds. The timer fires at this cadence.";
                 };
 
+                monitor = lib.mkOption {
+                  type        = lib.types.bool;
+                  default     = true;
+                  description = ''
+                    Whether the relay should alert when this source misses heartbeats.
+                    Set false for intermittent devices (e.g. laptops) so they show
+                    live/stale status without firing unreachable/recovered alerts.
+                  '';
+                };
+
                 tokenFile = lib.mkOption {
                   type        = lib.types.nullOr lib.types.path;
                   default     = null;
@@ -390,7 +400,7 @@
                             -X POST "${cfg.heartbeat.relayUrl}/heartbeat" \
                             -H "Authorization: Bearer ${tokenExpr}" \
                             -H "Content-Type: application/json" \
-                            -d '{"source":"${cfg.heartbeat.source}","interval":${toString cfg.heartbeat.interval}}' \
+                            -d '{"source":"${cfg.heartbeat.source}","interval":${toString cfg.heartbeat.interval},"monitor":${lib.boolToString cfg.heartbeat.monitor}}' \
                             || true
                         '';
                   };
