@@ -29,6 +29,11 @@ var (
 
 var authToken string
 
+// selfSource labels notifications the relay generates about itself (heartbeat
+// up/down alerts). It is excluded from the machines registry — the relay is not
+// a remote machine.
+const selfSource = "aisthetron"
+
 // ── Models ────────────────────────────────────────────────────────────────────
 
 type Notification struct {
@@ -324,7 +329,7 @@ func checkHeartbeats(h *hub, missedThreshold int) {
 			n, err := insertNotification(
 				hb.source+" unreachable",
 				fmt.Sprintf("No heartbeat for %s (%d missed × %ds interval).", silence, missedThreshold, hb.interval),
-				"aisthetron",
+				selfSource,
 			)
 			if err != nil {
 				log.Printf("heartbeat: insert alert for %q: %v", hb.source, err)
@@ -447,7 +452,7 @@ func handleHeartbeat(h *hub) http.HandlerFunc {
 			n, err := insertNotification(
 				body.Source+" recovered",
 				"Heartbeat resumed after outage.",
-				"aisthetron",
+				selfSource,
 			)
 			if err != nil {
 				log.Printf("heartbeat: recovery notification for %q: %v", body.Source, err)
@@ -637,7 +642,8 @@ func handleMachines(missedThreshold int) http.HandlerFunc {
 
 		nRows, err := db.Query(
 			`SELECT source, COUNT(*), MAX(created_at) FROM notifications
-			 WHERE source != '' GROUP BY source`,
+			 WHERE source != '' AND source != ? GROUP BY source`,
+			selfSource,
 		)
 		if err != nil {
 			log.Printf("machines: query notifications: %v", err)
