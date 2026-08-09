@@ -99,6 +99,23 @@ func initDB(path string) error {
 	// Safe migrations — silently ignored if columns already exist.
 	_, _ = db.Exec(`ALTER TABLE heartbeats ADD COLUMN health TEXT`)
 	_, _ = db.Exec(`ALTER TABLE heartbeats ADD COLUMN monitor INTEGER NOT NULL DEFAULT 1`)
+
+	// Health telemetry samples collected from wearables.
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS samples (
+			id         INTEGER PRIMARY KEY AUTOINCREMENT,
+			source     TEXT NOT NULL DEFAULT '',
+			metric     TEXT NOT NULL,
+			value      REAL NOT NULL,
+			unit       TEXT NOT NULL DEFAULT '',
+			ts         DATETIME NOT NULL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)
+	`)
+	if err != nil {
+		return err
+	}
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_samples_metric_ts ON samples(metric, ts)`)
 	return nil
 }
 
@@ -724,6 +741,176 @@ func handleMachines(missedThreshold int) http.HandlerFunc {
 	}
 }
 
+// ── Health telemetry ───────────────────────────────────────────────────────────
+
+type Sample struct {
+	Source string  `json:"source,omitempty"`
+	Metric string  `json:"metric"`
+	Value  float64 `json:"value"`
+	Unit   string  `json:"unit,omitempty"`
+	TS     string  `json:"ts"`
+}
+
+// normalizeTS parses a timestamp (RFC3339 with offset, RFC3339 UTC, or SQLite
+// space format) and returns canonical UTC RFC3339. Falls back to now.
+func normalizeTS(s string) string {
+	s = strings.TrimSpace(s)
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t.UTC().Format(time.RFC3339)
+	}
+	if t, err := parseSQLiteTime(s); err == nil {
+		return t.Format(time.RFC3339)
+	}
+	return time.Now().UTC().Format(time.RFC3339)
+}
+
+// handleMetrics dispatches POST (batch ingest) and GET (time-series query).
+func handleMetrics() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			ingestMetrics(w, r)
+		case http.MethodGet:
+			queryMetrics(w, r)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	}
+}
+
+func ingestMetrics(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Source  string   `json:"source"`
+		Samples []Sample `json:"samples"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if len(body.Samples) == 0 {
+		http.Error(w, "samples is required", http.StatusBadRequest)
+		return
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		log.Printf("metrics ingest: begin: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	stmt, err := tx.Prepare(
+		`INSERT INTO samples (source, metric, value, unit, ts) VALUES (?, ?, ?, ?, ?)`,
+	)
+	if err != nil {
+		tx.Rollback()
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	defer stmt.Close()
+
+	n := 0
+	for _, s := range body.Samples {
+		if strings.TrimSpace(s.Metric) == "" {
+			continue
+		}
+		src := s.Source
+		if src == "" {
+			src = body.Source
+		}
+		if _, err := stmt.Exec(src, s.Metric, s.Value, s.Unit, normalizeTS(s.TS)); err != nil {
+			tx.Rollback()
+			log.Printf("metrics ingest: insert: %v", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		n++
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("metrics ingest: commit: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"ingested": n})
+	log.Printf("metrics: ingested %d samples from source=%q", n, body.Source)
+}
+
+func queryMetrics(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	metric := strings.TrimSpace(q.Get("metric"))
+	if metric == "" {
+		http.Error(w, "metric query param is required", http.StatusBadRequest)
+		return
+	}
+	limit := 5000
+	if v := q.Get("limit"); v != "" {
+		fmt.Sscan(v, &limit)
+	}
+	if limit < 1 || limit > 50000 {
+		limit = 5000
+	}
+
+	query := `SELECT source, metric, value, unit, ts FROM samples WHERE metric = ?`
+	args := []any{metric}
+	if from := q.Get("from"); from != "" {
+		query += ` AND ts >= ?`
+		args = append(args, normalizeTS(from))
+	}
+	if to := q.Get("to"); to != "" {
+		query += ` AND ts <= ?`
+		args = append(args, normalizeTS(to))
+	}
+	query += ` ORDER BY ts ASC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		log.Printf("metrics query: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+	writeSamples(w, rows)
+}
+
+// handleMetricsLatest returns the most recent sample for each metric — the
+// dashboard's "current readings".
+func handleMetricsLatest() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		rows, err := db.Query(`
+			SELECT source, metric, value, unit, ts FROM samples s
+			WHERE ts = (SELECT MAX(ts) FROM samples WHERE metric = s.metric)
+			GROUP BY metric
+			ORDER BY metric
+		`)
+		if err != nil {
+			log.Printf("metrics latest: %v", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+		writeSamples(w, rows)
+	}
+}
+
+func writeSamples(w http.ResponseWriter, rows *sql.Rows) {
+	out := []Sample{}
+	for rows.Next() {
+		var s Sample
+		if err := rows.Scan(&s.Source, &s.Metric, &s.Value, &s.Unit, &s.TS); err != nil {
+			continue
+		}
+		s.TS = normalizeTS(s.TS)
+		out = append(out, s)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
+}
+
 func handleWS(h *hub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := r.URL.Query().Get("token")
@@ -804,6 +991,8 @@ func main() {
 	mux.HandleFunc("/mark-seen", requireBearer(handleMarkSeen()))
 	mux.HandleFunc("/notifications", requireBearer(handleDeleteNotifications()))
 	mux.HandleFunc("/machines", requireBearer(handleMachines(*flagHeartbeatMissed)))
+	mux.HandleFunc("/metrics", requireBearer(handleMetrics()))
+	mux.HandleFunc("/metrics/latest", requireBearer(handleMetricsLatest()))
 	mux.HandleFunc("/ws", handleWS(h))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

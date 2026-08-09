@@ -22,7 +22,7 @@
           # ── Go server ──────────────────────────────────────────────────────
           serverPkg = pkgs.buildGoModule {
             pname   = "aisthetron";
-            version = "0.5.2";
+            version = "0.6.0";
             src     = ./server;
 
             vendorHash = "sha256-M16ieYmUqzWJm5ZWFu4ISVD4553EHh31wT8oH1sJZX4=";
