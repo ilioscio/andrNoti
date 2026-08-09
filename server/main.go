@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -82,10 +83,16 @@ func initDB(path string) error {
 			source    TEXT PRIMARY KEY,
 			interval  INTEGER NOT NULL DEFAULT 60,
 			last_seen DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			alerted   INTEGER NOT NULL DEFAULT 0
+			alerted   INTEGER NOT NULL DEFAULT 0,
+			health    TEXT
 		)
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+	// Safe migration — adds the health payload column to pre-existing tables.
+	_, _ = db.Exec(`ALTER TABLE heartbeats ADD COLUMN health TEXT`)
+	return nil
 }
 
 func insertNotification(title, text, source string) (Notification, error) {
@@ -317,7 +324,7 @@ func checkHeartbeats(h *hub, missedThreshold int) {
 			n, err := insertNotification(
 				hb.source+" unreachable",
 				fmt.Sprintf("No heartbeat for %s (%d missed × %ds interval).", silence, missedThreshold, hb.interval),
-				"andrNoti",
+				"aisthetron",
 			)
 			if err != nil {
 				log.Printf("heartbeat: insert alert for %q: %v", hb.source, err)
@@ -388,8 +395,9 @@ func handleHeartbeat(h *hub) http.HandlerFunc {
 			return
 		}
 		var body struct {
-			Source   string `json:"source"`
-			Interval int    `json:"interval"`
+			Source   string          `json:"source"`
+			Interval int             `json:"interval"`
+			Health   json.RawMessage `json:"health,omitempty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
@@ -426,12 +434,20 @@ func handleHeartbeat(h *hub) http.HandlerFunc {
 			return
 		}
 
+		// Persist the latest health payload if one was included.
+		if len(body.Health) > 0 {
+			if _, err := db.Exec(`UPDATE heartbeats SET health = ? WHERE source = ?`,
+				string(body.Health), body.Source); err != nil {
+				log.Printf("heartbeat: store health for %q: %v", body.Source, err)
+			}
+		}
+
 		if wasAlerted {
 			// Send recovery notification.
 			n, err := insertNotification(
 				body.Source+" recovered",
 				"Heartbeat resumed after outage.",
-				"andrNoti",
+				"aisthetron",
 			)
 			if err != nil {
 				log.Printf("heartbeat: recovery notification for %q: %v", body.Source, err)
@@ -542,6 +558,149 @@ func handleDeleteNotifications() http.HandlerFunc {
 	}
 }
 
+// ── Machines registry ──────────────────────────────────────────────────────────
+
+type MachineInfo struct {
+	Source             string          `json:"source"`
+	Kind               string          `json:"kind"` // "heartbeat" | "event"
+	Interval           int             `json:"interval,omitempty"`
+	LastSeen           string          `json:"last_seen"`
+	Status             string          `json:"status"` // live | stale | down | unknown
+	Alerted            bool            `json:"alerted"`
+	Health             json.RawMessage `json:"health,omitempty"`
+	NotificationCount  int             `json:"notification_count"`
+	LastNotificationAt string          `json:"last_notification_at,omitempty"`
+}
+
+// machineStatus classifies a heartbeat source from the age of its last beat.
+func machineStatus(lastSeen string, interval, missedThreshold int) string {
+	t, err := parseSQLiteTime(lastSeen)
+	if err != nil {
+		return "unknown"
+	}
+	age := time.Since(t)
+	if age > time.Duration(interval*missedThreshold)*time.Second {
+		return "down"
+	}
+	if age > time.Duration(interval*2)*time.Second {
+		return "stale"
+	}
+	return "live"
+}
+
+// handleMachines returns the union of heartbeat sources (live infrastructure)
+// and notification sources (machines that have only ever sent messages).
+func handleMachines(missedThreshold int) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		machines := map[string]*MachineInfo{}
+		order := []string{}
+
+		hbRows, err := db.Query(
+			`SELECT source, interval, last_seen, alerted, COALESCE(health, '') FROM heartbeats`,
+		)
+		if err != nil {
+			log.Printf("machines: query heartbeats: %v", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		for hbRows.Next() {
+			var (
+				source     string
+				interval   int
+				lastSeen   string
+				alertedInt int
+				health     string
+			)
+			if err := hbRows.Scan(&source, &interval, &lastSeen, &alertedInt, &health); err != nil {
+				continue
+			}
+			mi := &MachineInfo{
+				Source:   source,
+				Kind:     "heartbeat",
+				Interval: interval,
+				LastSeen: lastSeen,
+				Status:   machineStatus(lastSeen, interval, missedThreshold),
+				Alerted:  alertedInt != 0,
+			}
+			if health != "" {
+				mi.Health = json.RawMessage(health)
+			}
+			machines[source] = mi
+			order = append(order, source)
+		}
+		hbRows.Close()
+
+		nRows, err := db.Query(
+			`SELECT source, COUNT(*), MAX(created_at) FROM notifications
+			 WHERE source != '' GROUP BY source`,
+		)
+		if err != nil {
+			log.Printf("machines: query notifications: %v", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		for nRows.Next() {
+			var (
+				source string
+				count  int
+				lastAt string
+			)
+			if err := nRows.Scan(&source, &count, &lastAt); err != nil {
+				continue
+			}
+			if mi, ok := machines[source]; ok {
+				mi.NotificationCount = count
+				mi.LastNotificationAt = lastAt
+			} else {
+				machines[source] = &MachineInfo{
+					Source:             source,
+					Kind:               "event",
+					LastSeen:           lastAt,
+					Status:             "unknown",
+					NotificationCount:  count,
+					LastNotificationAt: lastAt,
+				}
+				order = append(order, source)
+			}
+		}
+		nRows.Close()
+
+		out := make([]*MachineInfo, 0, len(machines))
+		for _, source := range order {
+			out = append(out, machines[source])
+		}
+		// Most recently active first. last_seen arrives in two formats (typed
+		// DATETIME columns vs. the MAX(created_at) aggregate), so compare parsed
+		// times rather than sorting the strings lexically.
+		sort.SliceStable(out, func(i, j int) bool {
+			ti, _ := parseSQLiteTime(out[i].LastSeen)
+			tj, _ := parseSQLiteTime(out[j].LastSeen)
+			return ti.After(tj)
+		})
+
+		// Normalise timestamps to a single UTC RFC3339 form so clients never have
+		// to disambiguate SQLite's two DATETIME renderings.
+		for _, mi := range out {
+			if t, err := parseSQLiteTime(mi.LastSeen); err == nil {
+				mi.LastSeen = t.Format(time.RFC3339)
+			}
+			if mi.LastNotificationAt != "" {
+				if t, err := parseSQLiteTime(mi.LastNotificationAt); err == nil {
+					mi.LastNotificationAt = t.Format(time.RFC3339)
+				}
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(out)
+	}
+}
+
 func handleWS(h *hub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := r.URL.Query().Get("token")
@@ -621,13 +780,14 @@ func main() {
 	mux.HandleFunc("/history", requireBearer(handleHistory()))
 	mux.HandleFunc("/mark-seen", requireBearer(handleMarkSeen()))
 	mux.HandleFunc("/notifications", requireBearer(handleDeleteNotifications()))
+	mux.HandleFunc("/machines", requireBearer(handleMachines(*flagHeartbeatMissed)))
 	mux.HandleFunc("/ws", handleWS(h))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
 
 	addr := "127.0.0.1:" + *flagPort
-	log.Printf("andrNoti listening on %s (heartbeat-missed=%d)", addr, *flagHeartbeatMissed)
+	log.Printf("aisthetron listening on %s (heartbeat-missed=%d)", addr, *flagHeartbeatMissed)
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatalf("listen: %v", err)
 	}

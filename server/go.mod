@@ -1,4 +1,4 @@
-module ilios.dev/andrnoti
+module ilios.dev/aisthetron
 
 go 1.22
 

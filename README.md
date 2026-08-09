@@ -1,9 +1,17 @@
-# andrNoti
+# Aisthetron
 
-Self-hosted push notification system. A Go **relay server** stores notifications
-in SQLite and broadcasts them over WebSocket. Remote servers send heartbeats to
-the relay so it can alert you if they go silent. An Android app maintains a
-persistent WebSocket connection and displays everything as system notifications.
+*An instrument of perception* — a self-hosted bridge between wearables and
+infrastructure (formerly **andrNoti**). A Go **relay server** stores
+notifications and machine telemetry in SQLite and broadcasts over WebSocket.
+Remote machines send heartbeats (with optional health payloads) so the relay
+can track them and alert you if they go silent; the `/machines` endpoint exposes
+that registry. An Android app maintains a persistent WebSocket connection,
+displays notifications, shows a live machines view, and (upcoming) archives
+health telemetry collected from a paired Galaxy Watch.
+
+> **Note:** the NixOS module still exposes `services.andrNoti` and the
+> `andr-noti` unit/state paths; renaming those is deferred coordinated infra
+> work (they're consumed by other systems via the published flake).
 
 ```
 [remote server]──POST /heartbeat──┐

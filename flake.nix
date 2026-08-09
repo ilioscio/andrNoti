@@ -1,5 +1,5 @@
 {
-  description = "andrNoti — self-hosted push notification server and Android app";
+  description = "Aisthetron — self-hosted wearable + infrastructure telemetry server and Android app";
 
   inputs = {
     nixpkgs.url     = "github:NixOS/nixpkgs/nixos-unstable";
@@ -21,15 +21,13 @@
 
           # ── Go server ──────────────────────────────────────────────────────
           serverPkg = pkgs.buildGoModule {
-            pname   = "andr-noti";
-            version = "0.4.5";
+            pname   = "aisthetron";
+            version = "0.5.0";
             src     = ./server;
 
             vendorHash = "sha256-M16ieYmUqzWJm5ZWFu4ISVD4553EHh31wT8oH1sJZX4=";
-
-            postInstall = ''
-              mv $out/bin/andrnoti $out/bin/andr-noti
-            '';
+            # The Go module path's last element is `aisthetron`, so the built
+            # binary is already named `aisthetron` — no postInstall rename.
           };
 
           # ── Android SDK ────────────────────────────────────────────────────
@@ -114,7 +112,7 @@
                 cd app
               fi
               if [ ! -f "pubspec.yaml" ]; then
-                echo "Error: run from the andrNoti repo root or the app/ subdirectory" >&2
+                echo "Error: run from the aisthetron repo root or the app/ subdirectory" >&2
                 exit 1
               fi
               echo "Building release APK..."
@@ -154,7 +152,7 @@
               ${sdkSetup}
 
               echo ""
-              echo "andrNoti Flutter dev environment ready."
+              echo "Aisthetron Flutter dev environment ready."
               flutter --version 2>/dev/null | head -1
               echo ""
               echo "  cd app && flutter run              # connected Android device (USB)"
@@ -171,10 +169,10 @@
         # ── NixOS module (system-independent) ─────────────────────────────────
         nixosModules.default = { config, pkgs, lib, ... }:
           let
-            cfg = config.services.andrNoti;
+            cfg = config.services.aisthetron;
           in {
-            options.services.andrNoti = {
-              enable = lib.mkEnableOption "andrNoti push notification server";
+            options.services.aisthetron = {
+              enable = lib.mkEnableOption "Aisthetron relay server (notifications + telemetry)";
 
               port = lib.mkOption {
                 type        = lib.types.port;
@@ -210,16 +208,26 @@
                 description = "Number of missed beats before alerting on a remote source.";
               };
 
+              dataDir = lib.mkOption {
+                type        = lib.types.path;
+                default     = "/var/lib/aisthetron";
+                description = ''
+                  Directory holding the SQLite database. Override to point at a
+                  pre-existing data directory when migrating (e.g. the legacy
+                  /var/lib/andr-noti) so history is preserved in place.
+                '';
+              };
+
               package = lib.mkOption {
                 type        = lib.types.package;
                 default     = self.packages.${pkgs.system}.default;
-                defaultText = lib.literalExpression "andrNoti.packages.\${system}.default";
-                description = "The andr-noti server package to use.";
+                defaultText = lib.literalExpression "aisthetron.packages.\${system}.default";
+                description = "The aisthetron server package to use.";
               };
 
               # ── Heartbeat sender (for remote servers) ─────────────────────
               heartbeat = {
-                enable = lib.mkEnableOption "andrNoti heartbeat sender — registers this machine with a relay server";
+                enable = lib.mkEnableOption "Aisthetron heartbeat sender — registers this machine with a relay server";
 
                 source = lib.mkOption {
                   type        = lib.types.str;
@@ -230,7 +238,7 @@
                 relayUrl = lib.mkOption {
                   type        = lib.types.str;
                   example     = "https://notify.example.com";
-                  description = "HTTP/HTTPS base URL of the andrNoti relay server (no trailing slash).";
+                  description = "HTTP/HTTPS base URL of the Aisthetron relay server (no trailing slash).";
                 };
 
                 interval = lib.mkOption {
@@ -260,36 +268,43 @@
                 assertions = [
                   {
                     assertion = cfg.tokenFile != null || cfg.token != null;
-                    message   = "services.andrNoti: set either tokenFile or token.";
+                    message   = "services.aisthetron: set either tokenFile or token.";
                   }
                   {
                     assertion = !(cfg.tokenFile != null && cfg.token != null);
-                    message   = "services.andrNoti: set only one of tokenFile or token, not both.";
+                    message   = "services.aisthetron: set only one of tokenFile or token, not both.";
                   }
                 ];
 
-                users.users.andr-noti = {
+                users.users.aisthetron = {
                   isSystemUser = true;
-                  group        = "andr-noti";
-                  description  = "andrNoti notification server";
+                  group        = "aisthetron";
+                  description  = "Aisthetron relay server";
                 };
-                users.groups.andr-noti = {};
+                users.groups.aisthetron = {};
 
-                systemd.services.andr-noti = {
-                  description = "andrNoti push notification server";
+                # Ensure the data directory exists and is owned by the service
+                # user. The recursive `Z` rule fixes ownership of a pre-existing
+                # directory (e.g. the legacy /var/lib/andr-noti) after the rename.
+                systemd.tmpfiles.rules = [
+                  "d '${cfg.dataDir}' 0750 aisthetron aisthetron - -"
+                  "Z '${cfg.dataDir}' 0750 aisthetron aisthetron - -"
+                ];
+
+                systemd.services.aisthetron = {
+                  description = "Aisthetron relay server";
                   after       = [ "network.target" ];
                   wantedBy    = [ "multi-user.target" ];
 
                   serviceConfig = {
                     Type           = "simple";
-                    User           = "andr-noti";
-                    Group          = "andr-noti";
-                    StateDirectory = "andr-noti";
+                    User           = "aisthetron";
+                    Group          = "aisthetron";
                     ExecStart      = lib.concatStringsSep " " (
                       [
-                        "${cfg.package}/bin/andr-noti"
+                        "${cfg.package}/bin/aisthetron"
                         "--port ${toString cfg.port}"
-                        "--db /var/lib/andr-noti/notifications.db"
+                        "--db ${cfg.dataDir}/notifications.db"
                         "--heartbeat-missed ${toString cfg.heartbeatMissed}"
                       ] ++ (
                         if cfg.tokenFile != null
@@ -305,12 +320,12 @@
                     ProtectSystem   = "strict";
                     ProtectHome     = true;
                     PrivateTmp      = true;
-                    ReadWritePaths  = [ "/var/lib/andr-noti" ];
+                    ReadWritePaths  = [ cfg.dataDir ];
                   };
                 };
 
                 services.nginx.commonHttpConfig = lib.mkIf (cfg.hostname != null) ''
-                  limit_req_zone $binary_remote_addr zone=andrnoti_ws:1m rate=5r/s;
+                  limit_req_zone $binary_remote_addr zone=aisthetron_ws:1m rate=5r/s;
                 '';
 
                 services.nginx.virtualHosts = lib.mkIf (cfg.hostname != null) {
@@ -329,7 +344,7 @@
                     locations."/ws" = {
                       proxyPass   = "http://127.0.0.1:${toString cfg.port}";
                       extraConfig = ''
-                        limit_req zone=andrnoti_ws burst=10 nodelay;
+                        limit_req zone=aisthetron_ws burst=10 nodelay;
                         proxy_http_version 1.1;
                         proxy_set_header Upgrade    $http_upgrade;
                         proxy_set_header Connection "upgrade";
@@ -346,16 +361,16 @@
                 assertions = [
                   {
                     assertion = cfg.heartbeat.tokenFile != null || cfg.heartbeat.token != null;
-                    message   = "services.andrNoti.heartbeat: set either tokenFile or token.";
+                    message   = "services.aisthetron.heartbeat: set either tokenFile or token.";
                   }
                   {
                     assertion = !(cfg.heartbeat.tokenFile != null && cfg.heartbeat.token != null);
-                    message   = "services.andrNoti.heartbeat: set only one of tokenFile or token, not both.";
+                    message   = "services.aisthetron.heartbeat: set only one of tokenFile or token, not both.";
                   }
                 ];
 
-                systemd.services.andr-noti-heartbeat = {
-                  description     = "andrNoti heartbeat ping to relay";
+                systemd.services.aisthetron-heartbeat = {
+                  description     = "Aisthetron heartbeat ping to relay";
                   after           = [ "network-online.target" ];
                   wants           = [ "network-online.target" ];
                   serviceConfig = {
@@ -370,7 +385,7 @@
                           then ''$(cat ${cfg.heartbeat.tokenFile})''
                           else cfg.heartbeat.token;
                       in
-                        pkgs.writeShellScript "andr-noti-heartbeat" ''
+                        pkgs.writeShellScript "aisthetron-heartbeat" ''
                           ${pkgs.curl}/bin/curl -sf \
                             -X POST "${cfg.heartbeat.relayUrl}/heartbeat" \
                             -H "Authorization: Bearer ${tokenExpr}" \
@@ -381,8 +396,8 @@
                   };
                 };
 
-                systemd.timers.andr-noti-heartbeat = {
-                  description = "andrNoti heartbeat timer";
+                systemd.timers.aisthetron-heartbeat = {
+                  description = "Aisthetron heartbeat timer";
                   wantedBy    = [ "timers.target" ];
                   timerConfig = {
                     OnBootSec         = "30s";
@@ -398,7 +413,7 @@
 
         # ── Overlay ────────────────────────────────────────────────────────────
         overlays.default = final: _prev: {
-          andr-noti = self.packages.${final.system}.default;
+          aisthetron = self.packages.${final.system}.default;
         };
       };
 }
