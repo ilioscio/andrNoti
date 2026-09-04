@@ -74,7 +74,15 @@ var db *sql.DB
 
 func initDB(path string) error {
 	var err error
-	db, err = sql.Open("sqlite", path)
+	// WAL + a busy timeout so concurrent access (long-poll queries vs. heartbeat
+	// writes vs. the command reaper) waits for the lock instead of failing with
+	// SQLITE_BUSY. Pragmas go in the DSN so every pooled connection inherits them.
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	dsn := path + sep + "_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
+	db, err = sql.Open("sqlite", dsn)
 	if err != nil {
 		return fmt.Errorf("open sqlite: %w", err)
 	}
@@ -1325,9 +1333,13 @@ func handleFleetPoll() http.HandlerFunc {
 			err := row.Scan(&c.ID, &c.Host, &c.Action, &c.Unit, &c.Lines)
 			if err == nil {
 				// Atomic claim — only one poller wins even with duplicates.
-				res, _ := db.Exec(
+				res, cerr := db.Exec(
 					`UPDATE commands SET status='claimed', claimed_at=CURRENT_TIMESTAMP
 					 WHERE id=? AND status='pending'`, c.ID)
+				if cerr != nil {
+					log.Printf("fleet: claim %d: %v", c.ID, cerr)
+					continue // transient (e.g. lock) — retry the whole loop
+				}
 				if n, _ := res.RowsAffected(); n == 1 {
 					log.Printf("fleet: CLAIM id=%d host=%q action=%q unit=%q", c.ID, host, c.Action, c.Unit)
 					w.Header().Set("Content-Type", "application/json")
