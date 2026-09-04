@@ -6,7 +6,7 @@ plugins {
 }
 
 android {
-    namespace = "com.example.andr_noti_app"
+    namespace = "dev.ilios.aisthetron"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
@@ -21,8 +21,7 @@ android {
     }
 
     defaultConfig {
-        // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
-        applicationId = "com.example.andr_noti_app"
+        applicationId = "dev.ilios.aisthetron"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion
@@ -42,6 +41,8 @@ android {
 
 dependencies {
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
+    // Wear Data Layer — receive health samples pushed from the watch collector.
+    implementation("com.google.android.gms:play-services-wearable:18.2.0")
 }
 
 flutter {

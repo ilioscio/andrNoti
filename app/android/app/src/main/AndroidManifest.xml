@@ -2,13 +2,13 @@
 
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
-    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
+    <uses-permission android:name="android.permission.USE_BIOMETRIC"/>
 
     <application
-        android:label="andrNoti"
+        android:label="Aisthetron"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
 
@@ -35,12 +35,22 @@
         <service
             xmlns:tools="http://schemas.android.com/tools"
             android:name="com.pravera.flutter_foreground_task.service.ForegroundService"
-            android:foregroundServiceType="remoteMessaging"
+            android:foregroundServiceType="dataSync"
             android:exported="false"
             tools:replace="android:foregroundServiceType"/>
 
         <meta-data
             android:name="flutterEmbedding"
             android:value="2"/>
+
+        <!-- Receives health-sample batches from the watch over the Wear Data Layer. -->
+        <service
+            android:name=".AisthetronWearListener"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.google.android.gms.wearable.MESSAGE_RECEIVED"/>
+                <data android:scheme="wear" android:host="*" android:pathPrefix="/aisthetron/metrics"/>
+            </intent-filter>
+        </service>
     </application>
 </manifest>

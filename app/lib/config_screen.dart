@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import 'config.dart';
 import 'notification_manager.dart';
+import 'secure_store.dart';
 
 class ConfigScreen extends StatefulWidget {
   const ConfigScreen({super.key});
@@ -14,25 +15,26 @@ class _ConfigScreenState extends State<ConfigScreen> {
   final _formKey = GlobalKey<FormState>();
   late TextEditingController _urlCtrl;
   late TextEditingController _tokenCtrl;
-  late TextEditingController _graceCtrl;
+  late TextEditingController _controlCtrl;
   bool _showDebugPanel = false;
   bool _saving = false;
 
   @override
   void initState() {
     super.initState();
-    _urlCtrl   = TextEditingController();
+    _urlCtrl = TextEditingController();
     _tokenCtrl = TextEditingController();
-    _graceCtrl = TextEditingController();
+    _controlCtrl = TextEditingController();
     _load();
   }
 
   Future<void> _load() async {
     final config = await AppConfig.load();
+    final control = await SecureStore.controlToken();
     if (mounted) {
-      _urlCtrl.text   = config.serverUrl;
+      _urlCtrl.text = config.serverUrl;
       _tokenCtrl.text = config.token;
-      _graceCtrl.text = config.relayDownGraceSeconds.toString();
+      _controlCtrl.text = control ?? '';
       setState(() => _showDebugPanel = config.showDebugPanel);
     }
   }
@@ -41,7 +43,7 @@ class _ConfigScreenState extends State<ConfigScreen> {
   void dispose() {
     _urlCtrl.dispose();
     _tokenCtrl.dispose();
-    _graceCtrl.dispose();
+    _controlCtrl.dispose();
     super.dispose();
   }
 
@@ -49,20 +51,11 @@ class _ConfigScreenState extends State<ConfigScreen> {
     if (!_formKey.currentState!.validate()) return;
     setState(() => _saving = true);
     try {
-      final url    = _urlCtrl.text.trim();
-      final token  = _tokenCtrl.text.trim();
-      final grace  = int.parse(_graceCtrl.text.trim());
-      await AppConfig.save(
-        serverUrl:             url,
-        token:                 token,
-        showDebugPanel:        _showDebugPanel,
-        relayDownGraceSeconds: grace,
-      );
-      await restartForegroundService(
-        serverUrl:             url,
-        token:                 token,
-        relayDownGraceSeconds: grace,
-      );
+      final url = _urlCtrl.text.trim();
+      final token = _tokenCtrl.text.trim();
+      await AppConfig.save(serverUrl: url, token: token, showDebugPanel: _showDebugPanel);
+      await SecureStore.setControlToken(_controlCtrl.text);
+      await restartForegroundService(serverUrl: url, token: token);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('Settings saved')),
@@ -117,20 +110,16 @@ class _ConfigScreenState extends State<ConfigScreen> {
               ),
               const SizedBox(height: 16),
               TextFormField(
-                controller: _graceCtrl,
+                controller: _controlCtrl,
                 decoration: const InputDecoration(
-                  labelText: 'Relay-down grace period (seconds)',
-                  hintText: '60',
-                  helperText: 'How long to wait before alerting on a lost relay connection.',
+                  labelText: 'Control Token (optional)',
+                  helperText: 'Elevated scope for viewing host logs. Stored in the Keystore, gated by biometric.',
+                  helperMaxLines: 3,
                   border: OutlineInputBorder(),
                 ),
-                keyboardType: TextInputType.number,
+                obscureText: true,
                 autocorrect: false,
-                validator: (v) {
-                  final n = int.tryParse(v?.trim() ?? '');
-                  if (n == null || n < 15) return 'Must be a number ≥ 15';
-                  return null;
-                },
+                // Optional — no validator; blank simply disables log retrieval.
               ),
               const SizedBox(height: 8),
               SwitchListTile(

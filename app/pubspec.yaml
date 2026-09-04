@@ -1,8 +1,8 @@
-name: andr_noti_app
-description: Self-hosted push notification client for andrNoti server.
+name: aisthetron
+description: Aisthetron — an instrument of perception bridging wearables and self-hosted infrastructure.
 publish_to: 'none'
 
-version: 0.4.5+8
+version: 1.1.0+2
 
 environment:
   sdk: '>=3.3.0 <4.0.0'
@@ -26,6 +26,23 @@ dependencies:
   # Persistent settings (server URL + token)
   shared_preferences: ^2.3.0
 
+  # Scrubbable metric line graphs
+  fl_chart: ^0.69.0
+
+  # Calendar day-picker (Health + Notifications)
+  table_calendar: ^3.1.2
+
+  # Material You dynamic color — match the phone's system theme.
+  # Pinned: 1.9.0's Android build.gradle.kts uses a Kotlin DSL that breaks in
+  # the Flutter plugin-module context.
+  dynamic_color: 1.7.0
+
+  # Biometric / device-credential gate before viewing logs (and later, control).
+  local_auth: ^2.3.0
+
+  # Control token in the Android Keystore, not plain SharedPreferences.
+  flutter_secure_storage: ^9.2.2
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -41,3 +58,11 @@ flutter:
   uses-material-design: true
   assets:
     - assets/
+  fonts:
+    - family: JetBrainsMono
+      fonts:
+        - asset: assets/fonts/JetBrainsMono-Regular.ttf
+        - asset: assets/fonts/JetBrainsMono-Medium.ttf
+          weight: 500
+        - asset: assets/fonts/JetBrainsMono-Bold.ttf
+          weight: 700

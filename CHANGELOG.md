@@ -1,5 +1,46 @@
 # Changelog
 
+## [0.7.0] — 2026-09-04
+
+### Fleet service monitoring & remote logs
+Machines view extended from a status board into a control view. Full runbook in
+[`docs/FLEET-MONITORING.md`](docs/FLEET-MONITORING.md).
+
+- **Unit status via heartbeat**: `services.aisthetron.heartbeat.units` reports each
+  declared unit's `ActiveState`/`SubState` on every beat (built with `jq`). The
+  relay upserts a `unit_status` table and raises a push on the ok→failed
+  transition (recovery on failed→ok), gated on `monitor` so silent hosts stay
+  quiet. `/machines` now carries a `units` array per heartbeat host.
+- **Remote logs via a relay command queue**: new `/fleet/command` (enqueue/status,
+  **control scope**), `/fleet/poll` + `/fleet/result` (host scope). Atomic claim,
+  ~25s long-poll, a reaper that fails stuck commands after 90s. `commands` table
+  doubles as a permanent audit log. Actions are a closed enum (`journal`,
+  `unit-status`) — read-only by construction, no start/stop/restart path exists.
+- **`aisthetron-agent`**: new pure-stdlib Go binary + `services.aisthetron-agent`
+  module. Long-polls the relay, re-validates every command against its own local
+  unit allowlist + action enum (the host is the final authority), runs via
+  explicit `exec` argv (no shell). Runs unprivileged as `aisthetron-agent` in
+  `systemd-journal`, heavily sandboxed (`CapabilityBoundingSet=""`,
+  `SystemCallFilter=@system-service`, `ProtectSystem=strict`).
+- **Two-tier auth**: a separate `controlTokenFile` (`--control-token-file`) gates
+  `/fleet/command`; must differ from the broadcast token; constant-time compare;
+  `503` when unset (feature off by default). The broadcast token still authorises
+  reads and the host-facing poll/result endpoints.
+- **DB**: WAL + `busy_timeout(5000)` to end `SQLITE_BUSY` 500s from long-poll vs
+  heartbeat-write contention.
+
+### Android App
+- **SERVICES panel** in the machine detail sheet: per-unit status LEDs; the
+  machines list shows a red "N services failed" line for any host with a down
+  unit.
+- **Gated log viewer** (`logs_screen.dart`): tapping a service prompts for
+  biometric/PIN (`local_auth`, `FlutterFragmentActivity`), then pulls the unit's
+  journal or `systemctl status` — `LOG`/`STATUS` toggle, line count, refresh,
+  exit-code status bar.
+- **Control token** stored in the Android Keystore (`flutter_secure_storage`), set
+  in Settings. Unlock cached ~5 min, cleared on background. The gate is a local
+  convenience barrier; the server control scope is the real boundary.
+
 ## [0.4.5] — 2026-03-08
 
 ### Android App
