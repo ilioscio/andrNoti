@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"flag"
@@ -8,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -25,9 +27,19 @@ var (
 	flagToken           = flag.String("token", "", "Auth token as a plain string (alternative to --token-file)")
 	flagDB              = flag.String("db", "notifications.db", "Path to SQLite database file")
 	flagHeartbeatMissed = flag.Int("heartbeat-missed", 3, "Missed beats before alerting on a remote source")
+
+	// The elevated "control" scope. Distinct from the broadcast token: it gates
+	// log retrieval (and, later, service control) via /fleet/command. Left empty,
+	// the whole /fleet/command surface returns 503 — the feature is off until a
+	// control token is explicitly provisioned.
+	flagControlTokenFile = flag.String("control-token-file", "", "Path to file containing the elevated control-scope token")
+	flagControlToken     = flag.String("control-token", "", "Control-scope token as a plain string (alternative to --control-token-file)")
 )
 
 var authToken string
+
+// controlToken authorises the elevated /fleet/command scope. Empty = disabled.
+var controlToken string
 
 // selfSource labels notifications the relay generates about itself (heartbeat
 // up/down alerts). It is excluded from the machines registry — the relay is not
@@ -116,6 +128,49 @@ func initDB(path string) error {
 		return err
 	}
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_samples_metric_ts ON samples(metric, ts)`)
+
+	// Latest systemd unit status per (source, unit). Pushed piggybacked on the
+	// heartbeat. `alerted` tracks the failed→ok transition so we notify once per
+	// fault, not every 60s.
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS unit_status (
+			source     TEXT NOT NULL,
+			unit       TEXT NOT NULL,
+			active     TEXT NOT NULL DEFAULT '',
+			sub        TEXT NOT NULL DEFAULT '',
+			failed     INTEGER NOT NULL DEFAULT 0,
+			alerted    INTEGER NOT NULL DEFAULT 0,
+			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (source, unit)
+		)
+	`)
+	if err != nil {
+		return err
+	}
+
+	// Fleet command queue AND audit log. Rows are never deleted by the server —
+	// every request a control token ever made is retained for forensics. Actions
+	// are a closed enum enforced in code; there is no free-form command column.
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS commands (
+			id          INTEGER PRIMARY KEY AUTOINCREMENT,
+			host        TEXT NOT NULL,
+			action      TEXT NOT NULL,
+			unit        TEXT NOT NULL DEFAULT '',
+			lines       INTEGER NOT NULL DEFAULT 200,
+			requester   TEXT NOT NULL DEFAULT '',
+			status      TEXT NOT NULL DEFAULT 'pending',
+			result      TEXT NOT NULL DEFAULT '',
+			result_code INTEGER NOT NULL DEFAULT 0,
+			created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			claimed_at  DATETIME,
+			done_at     DATETIME
+		)
+	`)
+	if err != nil {
+		return err
+	}
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_commands_host_status ON commands(host, status)`)
 	return nil
 }
 
@@ -298,6 +353,24 @@ func startHeartbeatChecker(h *hub, missedThreshold int) {
 	}
 }
 
+// startCommandReaper fails out commands that never completed so the app doesn't
+// poll a dead request forever: pending ones no agent claimed (host offline) and
+// claimed ones no agent answered (agent died mid-run).
+func startCommandReaper() {
+	ticker := time.NewTicker(15 * time.Second)
+	for range ticker.C {
+		if _, err := db.Exec(
+			`UPDATE commands SET status='error',
+			   result='timed out: host agent did not respond',
+			   result_code=-1, done_at=CURRENT_TIMESTAMP
+			 WHERE status IN ('pending','claimed')
+			   AND created_at < datetime('now','-90 seconds')`,
+		); err != nil {
+			log.Printf("reaper: %v", err)
+		}
+	}
+}
+
 func checkHeartbeats(h *hub, missedThreshold int) {
 	rows, err := db.Query(
 		`SELECT source, interval, last_seen, alerted, monitor FROM heartbeats`,
@@ -368,16 +441,68 @@ func checkHeartbeats(h *hub, missedThreshold int) {
 
 // ── Auth Middleware ────────────────────────────────────────────────────────────
 
+// bearerToken extracts the presented bearer credential, or "" if absent.
+func bearerToken(r *http.Request) string {
+	v := r.Header.Get("Authorization")
+	if !strings.HasPrefix(v, "Bearer ") {
+		return ""
+	}
+	return strings.TrimPrefix(v, "Bearer ")
+}
+
+// constEq compares two tokens in constant time (avoids leaking length/prefix via
+// timing). Both empty → false, so an unset control token never authorises.
+func constEq(presented, want string) bool {
+	if want == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(presented), []byte(want)) == 1
+}
+
 func requireBearer(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		v := r.Header.Get("Authorization")
-		if !strings.HasPrefix(v, "Bearer ") || strings.TrimPrefix(v, "Bearer ") != authToken {
+		if !constEq(bearerToken(r), authToken) {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 		next(w, r)
 	}
 }
+
+// requireControl gates the elevated fleet-command scope. If no control token is
+// configured, the endpoint is *disabled* (503) rather than open — control is
+// strictly opt-in. The broadcast token is NOT accepted here.
+func requireControl(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if controlToken == "" {
+			http.Error(w, "control scope not configured", http.StatusServiceUnavailable)
+			return
+		}
+		if !constEq(bearerToken(r), controlToken) {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
+}
+
+// ── Fleet command model ─────────────────────────────────────────────────────────
+
+// fleetActions is the closed set of things a host agent will ever be asked to do.
+// This phase is READ-ONLY by construction: no start/stop/restart exists here, and
+// the host agent independently refuses anything outside this set. Adding a
+// mutating action is a deliberate, reviewed change in BOTH places.
+var fleetActions = map[string]bool{
+	"journal":     true, // journalctl -u <unit> -n <lines>
+	"unit-status": true, // systemctl status <unit> (read-only)
+}
+
+// validUnitName rejects anything that isn't a plausible systemd unit token before
+// it is ever queued. The host agent's per-host allowlist is the real authority;
+// this is a cheap early reject that also keeps junk out of the audit log.
+var unitNameRe = regexp.MustCompile(`^[A-Za-z0-9@._:-]{1,128}$`)
+
+func validUnitName(s string) bool { return unitNameRe.MatchString(s) }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
@@ -428,6 +553,7 @@ func handleHeartbeat(h *hub) http.HandlerFunc {
 			Interval int             `json:"interval"`
 			Health   json.RawMessage `json:"health,omitempty"`
 			Monitor  *bool           `json:"monitor,omitempty"`
+			Units    []unitReport    `json:"units,omitempty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
@@ -476,6 +602,13 @@ func handleHeartbeat(h *hub) http.HandlerFunc {
 				string(body.Health), body.Source); err != nil {
 				log.Printf("heartbeat: store health for %q: %v", body.Source, err)
 			}
+		}
+
+		// Reconcile reported systemd units — updates the board and fires a push on
+		// the ok→failed transition (and a recovery on failed→ok). monitor=false
+		// hosts still track status but never push, matching heartbeat semantics.
+		if body.Units != nil {
+			applyUnitStatus(h, body.Source, monitor != 0, body.Units)
 		}
 
 		if wasAlerted {
@@ -594,6 +727,142 @@ func handleDeleteNotifications() http.HandlerFunc {
 	}
 }
 
+// ── Unit status (systemd) ───────────────────────────────────────────────────────
+
+// unitReport is the wire form pushed inside a heartbeat.
+type unitReport struct {
+	Name   string `json:"name"`
+	Active string `json:"active"` // active_state: active|inactive|failed|activating…
+	Sub    string `json:"sub"`    // sub_state: running|dead|failed|exited…
+}
+
+// UnitStatus is the /machines wire form.
+type UnitStatus struct {
+	Unit      string `json:"unit"`
+	Active    string `json:"active"`
+	Sub       string `json:"sub"`
+	Failed    bool   `json:"failed"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+func unitFailed(active, sub string) bool {
+	return active == "failed" || sub == "failed"
+}
+
+// applyUnitStatus upserts the reported units for a source and fires transition
+// notifications. `notify` is false for silent (monitor=false) hosts.
+func applyUnitStatus(h *hub, source string, notify bool, units []unitReport) {
+	for _, u := range units {
+		name := strings.TrimSpace(u.Name)
+		if name == "" {
+			continue
+		}
+		failed := unitFailed(u.Active, u.Sub)
+
+		var prevFailed, prevAlerted bool
+		row := db.QueryRow(`SELECT failed, alerted FROM unit_status WHERE source=? AND unit=?`, source, name)
+		var pf, pa int
+		known := row.Scan(&pf, &pa) == nil
+		prevFailed, prevAlerted = pf != 0, pa != 0
+
+		failedInt := 0
+		if failed {
+			failedInt = 1
+		}
+
+		// Decide the new alerted flag and whether to emit a transition notice.
+		newAlerted := prevAlerted
+		var note *Notification
+		if notify {
+			switch {
+			case failed && !prevAlerted:
+				n, err := insertNotification(
+					source+": "+name+" failed",
+					fmt.Sprintf("Unit %s is %s/%s on %s.", name, u.Active, u.Sub, source),
+					selfSource,
+				)
+				if err == nil {
+					note = &n
+					newAlerted = true
+				} else {
+					log.Printf("unit alert: insert for %q/%q: %v", source, name, err)
+				}
+			case !failed && prevAlerted:
+				n, err := insertNotification(
+					source+": "+name+" recovered",
+					fmt.Sprintf("Unit %s is back to %s/%s on %s.", name, u.Active, u.Sub, source),
+					selfSource,
+				)
+				if err == nil {
+					note = &n
+					newAlerted = false
+				}
+			}
+		} else {
+			// Silent host: never push, and keep alerted clear so re-enabling
+			// monitoring later doesn't dump a backlog of stale alerts.
+			newAlerted = false
+		}
+
+		newAlertedInt := 0
+		if newAlerted {
+			newAlertedInt = 1
+		}
+
+		if _, err := db.Exec(`
+			INSERT INTO unit_status (source, unit, active, sub, failed, alerted, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+			ON CONFLICT(source, unit) DO UPDATE SET
+				active=excluded.active, sub=excluded.sub, failed=excluded.failed,
+				alerted=excluded.alerted, updated_at=CURRENT_TIMESTAMP
+		`, source, name, u.Active, u.Sub, failedInt, newAlertedInt); err != nil {
+			log.Printf("unit status: upsert %q/%q: %v", source, name, err)
+			continue
+		}
+
+		if note != nil {
+			broadcastNotification(h, *note)
+			log.Printf("unit: source=%q unit=%q %s→%s", source, name,
+				boolWord(prevFailed, known), boolWord(failed, true))
+		}
+	}
+}
+
+func boolWord(failed, known bool) string {
+	if !known {
+		return "new"
+	}
+	if failed {
+		return "failed"
+	}
+	return "ok"
+}
+
+// loadUnitStatus returns the current units for a source, newest-updated first.
+func loadUnitStatus(source string) []UnitStatus {
+	rows, err := db.Query(
+		`SELECT unit, active, sub, failed, updated_at FROM unit_status WHERE source=? ORDER BY failed DESC, unit ASC`,
+		source,
+	)
+	if err != nil {
+		log.Printf("unit status: load %q: %v", source, err)
+		return nil
+	}
+	defer rows.Close()
+	var out []UnitStatus
+	for rows.Next() {
+		var u UnitStatus
+		var failedInt int
+		if err := rows.Scan(&u.Unit, &u.Active, &u.Sub, &failedInt, &u.UpdatedAt); err != nil {
+			continue
+		}
+		u.Failed = failedInt != 0
+		u.UpdatedAt = normalizeTS(u.UpdatedAt)
+		out = append(out, u)
+	}
+	return out
+}
+
 // ── Machines registry ──────────────────────────────────────────────────────────
 
 type MachineInfo struct {
@@ -605,6 +874,7 @@ type MachineInfo struct {
 	Alerted            bool            `json:"alerted"`
 	Monitor            bool            `json:"monitor"` // false = intermittent, no down/up alerts
 	Health             json.RawMessage `json:"health,omitempty"`
+	Units              []UnitStatus    `json:"units,omitempty"`
 	NotificationCount  int             `json:"notification_count"`
 	LastNotificationAt string          `json:"last_notification_at,omitempty"`
 }
@@ -669,6 +939,7 @@ func handleMachines(missedThreshold int) http.HandlerFunc {
 			if health != "" {
 				mi.Health = json.RawMessage(health)
 			}
+			mi.Units = loadUnitStatus(source)
 			machines[source] = mi
 			order = append(order, source)
 		}
@@ -911,6 +1182,223 @@ func writeSamples(w http.ResponseWriter, rows *sql.Rows) {
 	json.NewEncoder(w).Encode(out)
 }
 
+// ── Fleet command queue ─────────────────────────────────────────────────────────
+//
+// The relay is a mailbox, not an executor. The phone (control scope) drops a
+// request here; the target host's agent (broadcast/host scope) long-polls, runs
+// the closed-enum action against its OWN local allowlist, and posts the result
+// back. The relay never runs anything on a host and never holds host privileges.
+
+type fleetCommand struct {
+	ID     int64  `json:"id"`
+	Host   string `json:"host"`
+	Action string `json:"action"`
+	Unit   string `json:"unit"`
+	Lines  int    `json:"lines"`
+}
+
+// handleFleetCommand: POST enqueues a command (control scope); GET reports one.
+func handleFleetCommand() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			enqueueCommand(w, r)
+		case http.MethodGet:
+			reportCommand(w, r)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	}
+}
+
+func enqueueCommand(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Host      string `json:"host"`
+		Action    string `json:"action"`
+		Unit      string `json:"unit"`
+		Lines     int    `json:"lines"`
+		Requester string `json:"requester"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	body.Host = strings.TrimSpace(body.Host)
+	body.Action = strings.TrimSpace(body.Action)
+	body.Unit = strings.TrimSpace(body.Unit)
+	if body.Host == "" {
+		http.Error(w, "host is required", http.StatusBadRequest)
+		return
+	}
+	if !fleetActions[body.Action] {
+		http.Error(w, "unknown action", http.StatusBadRequest)
+		return
+	}
+	// Both current actions target a unit; sanitize before it hits the queue.
+	if !validUnitName(body.Unit) {
+		http.Error(w, "invalid unit name", http.StatusBadRequest)
+		return
+	}
+	if body.Lines < 1 || body.Lines > 2000 {
+		body.Lines = 200
+	}
+	requester := strings.TrimSpace(body.Requester)
+	if requester == "" {
+		requester = "app"
+	}
+
+	res, err := db.Exec(
+		`INSERT INTO commands (host, action, unit, lines, requester, status)
+		 VALUES (?, ?, ?, ?, ?, 'pending')`,
+		body.Host, body.Action, body.Unit, body.Lines, requester,
+	)
+	if err != nil {
+		log.Printf("fleet: enqueue: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	id, _ := res.LastInsertId()
+	// Audit line — every elevated request is logged, whoever made it.
+	log.Printf("fleet: ENQUEUE id=%d host=%q action=%q unit=%q lines=%d requester=%q",
+		id, body.Host, body.Action, body.Unit, body.Lines, requester)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"id": id})
+}
+
+func reportCommand(w http.ResponseWriter, r *http.Request) {
+	var id int64
+	if v := r.URL.Query().Get("id"); v != "" {
+		fmt.Sscan(v, &id)
+	}
+	if id <= 0 {
+		http.Error(w, "id is required", http.StatusBadRequest)
+		return
+	}
+	var (
+		host, action, unit, status, result, createdAt string
+		resultCode                                    int
+		doneAt                                        sql.NullString
+	)
+	row := db.QueryRow(
+		`SELECT host, action, unit, status, result, result_code, created_at, done_at
+		 FROM commands WHERE id=?`, id)
+	if err := row.Scan(&host, &action, &unit, &status, &result, &resultCode, &createdAt, &doneAt); err != nil {
+		if err == sql.ErrNoRows {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		log.Printf("fleet: report %d: %v", id, err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	out := map[string]any{
+		"id": id, "host": host, "action": action, "unit": unit,
+		"status": status, "result": result, "result_code": resultCode,
+		"created_at": normalizeTS(createdAt),
+	}
+	if doneAt.Valid {
+		out["done_at"] = normalizeTS(doneAt.String)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
+}
+
+// handleFleetPoll: a host agent long-polls for its next pending command and
+// atomically claims it. Host scope (broadcast token). Returns 204 on timeout.
+func handleFleetPoll() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		host := strings.TrimSpace(r.URL.Query().Get("host"))
+		if host == "" {
+			http.Error(w, "host is required", http.StatusBadRequest)
+			return
+		}
+		deadline := time.Now().Add(25 * time.Second)
+		for {
+			var c fleetCommand
+			row := db.QueryRow(
+				`SELECT id, host, action, unit, lines FROM commands
+				 WHERE host=? AND status='pending' ORDER BY id ASC LIMIT 1`, host)
+			err := row.Scan(&c.ID, &c.Host, &c.Action, &c.Unit, &c.Lines)
+			if err == nil {
+				// Atomic claim — only one poller wins even with duplicates.
+				res, _ := db.Exec(
+					`UPDATE commands SET status='claimed', claimed_at=CURRENT_TIMESTAMP
+					 WHERE id=? AND status='pending'`, c.ID)
+				if n, _ := res.RowsAffected(); n == 1 {
+					log.Printf("fleet: CLAIM id=%d host=%q action=%q unit=%q", c.ID, host, c.Action, c.Unit)
+					w.Header().Set("Content-Type", "application/json")
+					json.NewEncoder(w).Encode(c)
+					return
+				}
+				continue // lost the race; look again immediately
+			} else if err != sql.ErrNoRows {
+				log.Printf("fleet: poll %q: %v", host, err)
+				http.Error(w, "internal error", http.StatusInternalServerError)
+				return
+			}
+			if time.Now().After(deadline) {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(time.Second):
+			}
+		}
+	}
+}
+
+// handleFleetResult: a host agent posts the outcome of a claimed command. Host
+// scope. Only a claimed command can transition to done/error.
+func handleFleetResult() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			ID         int64  `json:"id"`
+			Status     string `json:"status"`
+			Result     string `json:"result"`
+			ResultCode int    `json:"result_code"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if body.Status != "done" && body.Status != "error" {
+			http.Error(w, "status must be done|error", http.StatusBadRequest)
+			return
+		}
+		// Cap stored result so a runaway journal can't bloat the DB.
+		const maxResult = 256 * 1024
+		if len(body.Result) > maxResult {
+			body.Result = body.Result[:maxResult] + "\n…[truncated]"
+		}
+		res, err := db.Exec(
+			`UPDATE commands SET status=?, result=?, result_code=?, done_at=CURRENT_TIMESTAMP
+			 WHERE id=? AND status='claimed'`,
+			body.Status, body.Result, body.ResultCode, body.ID)
+		if err != nil {
+			log.Printf("fleet: result %d: %v", body.ID, err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			http.Error(w, "no claimed command with that id", http.StatusConflict)
+			return
+		}
+		log.Printf("fleet: RESULT id=%d status=%q code=%d bytes=%d", body.ID, body.Status, body.ResultCode, len(body.Result))
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	}
+}
+
 func handleWS(h *hub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := r.URL.Query().Get("token")
@@ -975,14 +1463,36 @@ func main() {
 		log.Fatal("one of --token-file or --token is required")
 	}
 
+	// Control scope is optional. When unset, /fleet/command returns 503 and the
+	// log/control feature is simply off.
+	switch {
+	case *flagControlTokenFile != "":
+		raw, err := os.ReadFile(*flagControlTokenFile)
+		if err != nil {
+			log.Fatalf("read control-token file: %v", err)
+		}
+		controlToken = strings.TrimSpace(string(raw))
+	case *flagControlToken != "":
+		controlToken = *flagControlToken
+	}
+	if controlToken == authToken && controlToken != "" {
+		log.Fatal("control token must differ from the broadcast token")
+	}
+
 	if err := initDB(*flagDB); err != nil {
 		log.Fatalf("init db: %v", err)
 	}
 	log.Printf("database: %s", *flagDB)
+	if controlToken != "" {
+		log.Printf("fleet control scope: ENABLED")
+	} else {
+		log.Printf("fleet control scope: disabled (no control token)")
+	}
 
 	h := newHub()
 	go h.run()
 	go startHeartbeatChecker(h, *flagHeartbeatMissed)
+	go startCommandReaper()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/send", requireBearer(handleSend(h)))
@@ -993,6 +1503,11 @@ func main() {
 	mux.HandleFunc("/machines", requireBearer(handleMachines(*flagHeartbeatMissed)))
 	mux.HandleFunc("/metrics", requireBearer(handleMetrics()))
 	mux.HandleFunc("/metrics/latest", requireBearer(handleMetricsLatest()))
+	// Fleet command queue: /command is elevated (control scope); the host-facing
+	// /poll and /result use the broadcast token the agents already hold.
+	mux.HandleFunc("/fleet/command", requireControl(handleFleetCommand()))
+	mux.HandleFunc("/fleet/poll", requireBearer(handleFleetPoll()))
+	mux.HandleFunc("/fleet/result", requireBearer(handleFleetResult()))
 	mux.HandleFunc("/ws", handleWS(h))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

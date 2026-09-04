@@ -22,12 +22,22 @@
           # ── Go server ──────────────────────────────────────────────────────
           serverPkg = pkgs.buildGoModule {
             pname   = "aisthetron";
-            version = "0.6.0";
+            version = "0.7.0";
             src     = ./server;
 
             vendorHash = "sha256-M16ieYmUqzWJm5ZWFu4ISVD4553EHh31wT8oH1sJZX4=";
             # The Go module path's last element is `aisthetron`, so the built
             # binary is already named `aisthetron` — no postInstall rename.
+          };
+
+          # ── Host agent ─────────────────────────────────────────────────────
+          # The fleet command-queue worker. Pure stdlib (no deps → vendorHash
+          # null). Read-only by construction; see agent/main.go.
+          agentPkg = pkgs.buildGoModule {
+            pname      = "aisthetron-agent";
+            version    = "0.7.0";
+            src        = ./agent;
+            vendorHash = null;
           };
 
           # ── Android SDK ────────────────────────────────────────────────────
@@ -124,6 +134,7 @@
 
         in {
           packages.default = serverPkg;
+          packages.agent = agentPkg;
 
           apps.buildApk = {
             type    = "app";
@@ -169,8 +180,54 @@
         # ── NixOS module (system-independent) ─────────────────────────────────
         nixosModules.default = { config, pkgs, lib, ... }:
           let
-            cfg = config.services.aisthetron;
+            cfg      = config.services.aisthetron;
+            cfgAgent = config.services.aisthetron-agent;
           in {
+            options.services.aisthetron-agent = {
+              enable = lib.mkEnableOption "Aisthetron host agent — serves read-only journal/status queries from the relay command queue";
+
+              relayUrl = lib.mkOption {
+                type        = lib.types.str;
+                example     = "https://notify.example.com";
+                description = "HTTP/HTTPS base URL of the relay (no trailing slash).";
+              };
+
+              host = lib.mkOption {
+                type        = lib.types.str;
+                example     = "octopus";
+                description = "This host's source name. MUST match its heartbeat source so the app addresses commands correctly.";
+              };
+
+              tokenFile = lib.mkOption {
+                type        = lib.types.path;
+                description = ''
+                  Path to the relay bearer (broadcast) token file. This is the same
+                  host token used for heartbeats — the agent authenticates to the
+                  relay's host-facing poll/result endpoints with it. The file must be
+                  readable by the aisthetron-agent user.
+                '';
+              };
+
+              units = lib.mkOption {
+                type        = lib.types.listOf lib.types.str;
+                default     = [];
+                example     = [ "nginx.service" "aisthetron.service" ];
+                description = ''
+                  The allowlist of systemd units this agent will serve journal/status
+                  for. This is the FINAL authority: any command naming a unit outside
+                  this list is refused locally, regardless of what the relay forwards.
+                  Mirror services.aisthetron.heartbeat.units here.
+                '';
+              };
+
+              package = lib.mkOption {
+                type        = lib.types.package;
+                default     = self.packages.${pkgs.system}.agent;
+                defaultText = lib.literalExpression "aisthetron.packages.\${system}.agent";
+                description = "The aisthetron-agent package to use.";
+              };
+            };
+
             options.services.aisthetron = {
               enable = lib.mkEnableOption "Aisthetron relay server (notifications + telemetry)";
 
@@ -199,6 +256,18 @@
                 description = ''
                   Auth token as a plain string. Less secure than tokenFile because the
                   value is stored in the Nix store. Prefer tokenFile for production.
+                '';
+              };
+
+              controlTokenFile = lib.mkOption {
+                type        = lib.types.nullOr lib.types.path;
+                default     = null;
+                description = ''
+                  Path to a file containing the elevated CONTROL-scope token (e.g. from
+                  agenix). This token — distinct from the broadcast token above — gates
+                  the /fleet/command surface (log retrieval, and later service control).
+                  When unset, /fleet/command is disabled entirely (returns 503). Must
+                  differ from the broadcast token.
                 '';
               };
 
@@ -254,6 +323,19 @@
                     Whether the relay should alert when this source misses heartbeats.
                     Set false for intermittent devices (e.g. laptops) so they show
                     live/stale status without firing unreachable/recovered alerts.
+                  '';
+                };
+
+                units = lib.mkOption {
+                  type        = lib.types.listOf lib.types.str;
+                  default     = [];
+                  example     = [ "nginx.service" "aisthetron.service" ];
+                  description = ''
+                    Declared allowlist of systemd units to report on each heartbeat.
+                    Each unit's ActiveState/SubState is pushed to the relay, which shows
+                    them in the machines view and raises a push notification on the
+                    ok→failed transition. This SAME list should be mirrored in
+                    services.aisthetron-agent.units to allow log retrieval for them.
                   '';
                 };
 
@@ -320,7 +402,8 @@
                         if cfg.tokenFile != null
                         then [ "--token-file ${cfg.tokenFile}" ]
                         else [ "--token ${cfg.token}" ]
-                      )
+                      ) ++ lib.optional (cfg.controlTokenFile != null)
+                        "--control-token-file ${cfg.controlTokenFile}"
                     );
                     Restart    = "always";
                     RestartSec = 5;
@@ -394,13 +477,32 @@
                           if cfg.heartbeat.tokenFile != null
                           then ''$(cat ${cfg.heartbeat.tokenFile})''
                           else cfg.heartbeat.token;
+                        systemctl = "${config.systemd.package}/bin/systemctl";
+                        jq        = "${pkgs.jq}/bin/jq";
+                        # Bash array literal of the declared units (safely quoted).
+                        unitsArr  = lib.concatMapStringsSep " " (u: lib.escapeShellArg u) cfg.heartbeat.units;
                       in
                         pkgs.writeShellScript "aisthetron-heartbeat" ''
+                          set -u
+                          units_json='[]'
+                          for u in ${unitsArr}; do
+                            as="$(${systemctl} show -p ActiveState --value "$u" 2>/dev/null || true)"
+                            ss="$(${systemctl} show -p SubState   --value "$u" 2>/dev/null || true)"
+                            units_json="$(${jq} -c --arg n "$u" --arg a "$as" --arg s "$ss" \
+                              '. + [{name:$n,active:$a,sub:$s}]' <<<"$units_json")"
+                          done
+                          payload="$(${jq} -cn \
+                            --arg src "${cfg.heartbeat.source}" \
+                            --argjson interval ${toString cfg.heartbeat.interval} \
+                            --argjson monitor ${lib.boolToString cfg.heartbeat.monitor} \
+                            --argjson units "$units_json" \
+                            '{source:$src,interval:$interval,monitor:$monitor}
+                             + (if ($units|length)>0 then {units:$units} else {} end)')"
                           ${pkgs.curl}/bin/curl -sf \
                             -X POST "${cfg.heartbeat.relayUrl}/heartbeat" \
                             -H "Authorization: Bearer ${tokenExpr}" \
                             -H "Content-Type: application/json" \
-                            -d '{"source":"${cfg.heartbeat.source}","interval":${toString cfg.heartbeat.interval},"monitor":${lib.boolToString cfg.heartbeat.monitor}}' \
+                            -d "$payload" \
                             || true
                         '';
                   };
@@ -414,6 +516,64 @@
                     OnUnitActiveSec   = "${toString cfg.heartbeat.interval}s";
                     AccuracySec       = "10s";
                     Persistent        = true;
+                  };
+                };
+              })
+
+              # ── Host agent (fleet command queue worker) ────────────────────
+              (lib.mkIf cfgAgent.enable {
+                users.users.aisthetron-agent = {
+                  isSystemUser = true;
+                  group        = "aisthetron-agent";
+                  description  = "Aisthetron host agent (read-only journal/status)";
+                  # Read the system journal without any privilege escalation.
+                  extraGroups  = [ "systemd-journal" ];
+                };
+                users.groups.aisthetron-agent = {};
+
+                systemd.services.aisthetron-agent = {
+                  description = "Aisthetron host agent — read-only fleet queries";
+                  after       = [ "network-online.target" ];
+                  wants       = [ "network-online.target" ];
+                  wantedBy    = [ "multi-user.target" ];
+
+                  serviceConfig = {
+                    Type      = "simple";
+                    User      = "aisthetron-agent";
+                    Group     = "aisthetron-agent";
+                    ExecStart = lib.concatStringsSep " " [
+                      "${cfgAgent.package}/bin/aisthetron-agent"
+                      "--relay ${cfgAgent.relayUrl}"
+                      "--host ${cfgAgent.host}"
+                      "--token-file ${cfgAgent.tokenFile}"
+                      "--units ${lib.escapeShellArg (lib.concatStringsSep "," cfgAgent.units)}"
+                      "--journalctl ${config.systemd.package}/bin/journalctl"
+                      "--systemctl ${config.systemd.package}/bin/systemctl"
+                    ];
+                    Restart    = "always";
+                    RestartSec = 5;
+
+                    # Hardening. The agent only reads: no capabilities, no new privs,
+                    # read-only filesystem, restricted syscalls. AF_UNIX is required so
+                    # journalctl/systemctl can reach the journald/systemd sockets.
+                    NoNewPrivileges         = true;
+                    ProtectSystem           = "strict";
+                    ProtectHome             = true;
+                    PrivateTmp              = true;
+                    PrivateDevices          = true;
+                    ProtectKernelTunables   = true;
+                    ProtectKernelModules    = true;
+                    ProtectControlGroups    = true;
+                    ProtectClock            = true;
+                    ProtectHostname         = true;
+                    RestrictNamespaces      = true;
+                    RestrictRealtime        = true;
+                    LockPersonality         = true;
+                    MemoryDenyWriteExecute  = true;
+                    CapabilityBoundingSet   = "";
+                    RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
+                    SystemCallFilter        = [ "@system-service" ];
+                    SystemCallErrorNumber   = "EPERM";
                   };
                 };
               })
